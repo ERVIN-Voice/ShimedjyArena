@@ -96,6 +96,7 @@ class TransparentPetWindow(QWidget):
     request_scale_delta = Signal(int)
     request_toggle_sleep = Signal()
     request_show_pairing = Signal()
+    request_toggle_camera_hud = Signal()
     request_quit = Signal()
 
     def __init__(self, width: int, height: int) -> None:
@@ -106,6 +107,7 @@ class TransparentPetWindow(QWidget):
         self._drag_offset = QPoint(0, 0)
         self._is_sleeping: bool = False
         self._can_handoff: bool = False
+        self._has_camera: bool = False
 
         self.setWindowTitle("GCS Shimeji")
         self.setWindowFlags(
@@ -119,9 +121,10 @@ class TransparentPetWindow(QWidget):
         self.setMouseTracking(False)
         self.setFixedSize(width, height)
 
-    def set_context_state(self, *, is_sleeping: bool, can_handoff: bool) -> None:
+    def set_context_state(self, *, is_sleeping: bool, can_handoff: bool, has_camera: bool = False) -> None:
         self._is_sleeping = is_sleeping
         self._can_handoff = can_handoff
+        self._has_camera = has_camera
 
     def set_rendered_frame(self, frame: RenderedFrame) -> None:
         """Update displayed pixel frame and refresh the per-pixel click-through window mask."""
@@ -222,6 +225,11 @@ class TransparentPetWindow(QWidget):
         qr_action = QAction("Show Pairing Info / QR", menu)
         qr_action.triggered.connect(self.request_show_pairing.emit)
         menu.addAction(qr_action)
+
+        if self._has_camera:
+            cam_action = QAction("Camera & Gestures HUD", menu)
+            cam_action.triggered.connect(self.request_toggle_camera_hud.emit)
+            menu.addAction(cam_action)
 
         quit_action = QAction("Quit GCS Shimeji", menu)
         quit_action.triggered.connect(self.request_quit.emit)

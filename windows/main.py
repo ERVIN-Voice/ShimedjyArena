@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from shared.config_loader import load_avatar_config
-from windows.camera import CameraBackend, create_camera
+from windows.camera import CameraBackend, create_camera, probe_cameras
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -54,7 +54,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--camera",
         choices=["none", "webcam", "ps3_eye"],
         default="none",
-        help="Enable optional camera backend for incoming handoff gesture confirmation",
+        help="Enable live camera backend for real-time gesture control & handoff confirmation",
     )
     parser.add_argument(
         "--camera-index",
@@ -67,6 +67,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["vga_60", "qvga_120", "vga_30"],
         default="vga_60",
         help="PS3 Eye resolution/FPS preset (default: vga_60)",
+    )
+    parser.add_argument(
+        "--no-camera-preview",
+        action="store_true",
+        help="Start camera gesture tracking without initially showing the HUD preview window",
+    )
+    parser.add_argument(
+        "--hand-model",
+        type=Path,
+        default=None,
+        help="Optional path to local MediaPipe hand_landmarker.task model for 21-point neural hand tracking",
+    )
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="Probe available camera indices and exit",
     )
     parser.add_argument(
         "--log-level",
@@ -83,6 +99,14 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    if args.list_cameras:
+        found = probe_cameras(max_index=6)
+        if found:
+            print(f"Available OpenCV camera indices: {found}")
+        else:
+            print("No working cameras detected on indices 0..5.")
+        return 0
 
     from PySide6.QtWidgets import QApplication
     from windows.desktop_pet import DesktopPetApp
@@ -108,9 +132,10 @@ def main(argv: list[str] | None = None) -> int:
         hub_port=args.port,
         enable_mdns=not args.no_mdns,
         camera=camera,
+        show_camera_preview=not args.no_camera_preview,
+        hand_model_path=args.hand_model,
     )
 
-    # Allow clean Ctrl+C shutdown in console
     def _handle_sigint(*_args: object) -> None:
         pet_app.shutdown()
 

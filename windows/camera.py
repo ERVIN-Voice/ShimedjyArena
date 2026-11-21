@@ -1,16 +1,19 @@
-"""Camera capture interfaces and implementations for GCS Shimeji gesture confirmation.
+"""Camera capture interfaces and implementations for GCS Shimeji gesture control.
 
 Supports:
-- Sony PlayStation 3 Eye (explicitly non-depth 2D RGB high-FPS camera)
+- Sony PlayStation 3 Eye (explicitly non-depth 2D RGB high-FPS camera, CAP_DSHOW priority on Windows)
 - Standard OpenCV webcams (2D RGB)
 - Android camera frame stream adapter (2D RGB)
 - Synthetic camera for deterministic automated testing
+- ThreadedCameraReader for non-blocking background frame capture
 """
 
 from __future__ import annotations
 
 import logging
+import platform
 import queue
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -79,6 +82,38 @@ class CameraBackend(ABC):
         self.close()
 
 
+def _preferred_windows_backends(explicit_api: int | None) -> list[int | None]:
+    """Order OpenCV capture APIs cleanly; DirectShow is much more reliable for PS3 Eye on Windows."""
+    if explicit_api is not None:
+        return [explicit_api]
+    if platform.system() == "Windows":
+        backends: list[int | None] = []
+        if hasattr(cv2, "CAP_DSHOW"):
+            backends.append(int(cv2.CAP_DSHOW))
+        if hasattr(cv2, "CAP_MSMF"):
+            backends.append(int(cv2.CAP_MSMF))
+        backends.append(None)
+        return backends
+    return [None]
+
+
+def probe_cameras(max_index: int = 5) -> list[int]:
+    """Probe local OpenCV camera indices that successfully open and return a frame."""
+    available: list[int] = []
+    for idx in range(max(1, max_index)):
+        for api in _preferred_windows_backends(None):
+            cap = cv2.VideoCapture(idx, api) if api is not None else cv2.VideoCapture(idx)
+            try:
+                if cap.isOpened():
+                    ok, frame = cap.read()
+                    if ok and frame is not None and frame.size > 0:
+                        available.append(idx)
+                        break
+            finally:
+                cap.release()
+    return available
+
+
 class OpenCVCamera(CameraBackend):
     """Standard 2D RGB webcam backend backed by OpenCV VideoCapture."""
 
@@ -104,6 +139,10 @@ class OpenCVCamera(CameraBackend):
         self._frame_index: int = 0
 
     @property
+    def device_index(self) -> int:
+        return self._device_index
+
+    @property
     def capabilities(self) -> CameraCapabilities:
         return CameraCapabilities(
             device_kind=self._device_kind,
@@ -122,31 +161,43 @@ class OpenCVCamera(CameraBackend):
     def open(self) -> bool:
         if self.is_opened:
             return True
-        if self._backend_api is not None:
-            cap = cv2.VideoCapture(self._device_index, self._backend_api)
-        else:
-            cap = cv2.VideoCapture(self._device_index)
 
-        if not cap.isOpened():
-            cap.release()
-            logger.warning("Failed to open %s at index %d", self._device_kind, self._device_index)
-            return False
+        for api in _preferred_windows_backends(self._backend_api):
+            cap = cv2.VideoCapture(self._device_index, api) if api is not None else cv2.VideoCapture(self._device_index)
+            if not cap.isOpened():
+                cap.release()
+                continue
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._height))
-        cap.set(cv2.CAP_PROP_FPS, float(self._fps))
-        self._configure_capture(cap)
-        self._capture = cap
-        self._frame_index = 0
-        logger.info(
-            "Opened %s (index=%d, requested=%dx%d@%.0ffps, depth=False)",
-            self._device_kind,
-            self._device_index,
-            self._width,
-            self._height,
-            self._fps,
-        )
-        return True
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._width))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._height))
+            cap.set(cv2.CAP_PROP_FPS, float(self._fps))
+            self._configure_capture(cap)
+
+            # Verify a real frame can be grabbed (guards against ghost virtual cameras)
+            ok, test_frame = cap.read()
+            if not ok or test_frame is None or test_frame.size == 0:
+                cap.release()
+                continue
+
+            self._capture = cap
+            self._frame_index = 0
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or test_frame.shape[1])
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or test_frame.shape[0])
+            actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or self._fps)
+            logger.info(
+                "Opened %s (index=%d, api=%s, actual=%dx%d@%.0ffps, depth=False)",
+                self._device_kind,
+                self._device_index,
+                api,
+                actual_w,
+                actual_h,
+                actual_fps,
+            )
+            return True
+
+        logger.warning("Failed to open %s at index %d", self._device_kind, self._device_index)
+        return False
 
     def _configure_capture(self, cap: cv2.VideoCapture) -> None:
         """Hook for subclasses (e.g., PS3 Eye manual exposure/gain tuning)."""
@@ -180,7 +231,7 @@ class PS3EyeCamera(OpenCVCamera):
     Important architectural note:
     The PS3 Eye is a high-framerate 2D RGB camera (NOT a depth / RGB-D sensor).
     It excels at low-latency 60fps (640x480) or 120fps (320x240) motion/hand capture
-    when auto-exposure is locked down to minimize motion blur.
+    via DirectShow (CL-Eye / libusb-win32 / open-source PS3 Eye drivers on Windows).
     """
 
     SUPPORTED_MODES: dict[str, tuple[int, int, float]] = {
@@ -194,8 +245,8 @@ class PS3EyeCamera(OpenCVCamera):
         device_index: int = 0,
         *,
         mode: Literal["vga_60", "qvga_120", "vga_30"] = "vga_60",
-        manual_exposure: float | None = -5.0,
-        gain: float | None = 20.0,
+        manual_exposure: float | None = None,
+        gain: float | None = None,
         mirror: bool = True,
         backend_api: int | None = None,
     ) -> None:
@@ -216,6 +267,10 @@ class PS3EyeCamera(OpenCVCamera):
         )
 
     @property
+    def mode(self) -> str:
+        return self._mode
+
+    @property
     def capabilities(self) -> CameraCapabilities:
         return CameraCapabilities(
             device_kind="ps3_eye",
@@ -228,7 +283,8 @@ class PS3EyeCamera(OpenCVCamera):
         )
 
     def _configure_capture(self, cap: cv2.VideoCapture) -> None:
-        # Disable auto-exposure & auto-gain where driver supports it to prevent motion blur
+        # Leave auto-exposure enabled by default so rooms of any brightness work out-of-the-box;
+        # apply manual overrides only if explicitly requested.
         if self._manual_exposure is not None:
             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
             cap.set(cv2.CAP_PROP_EXPOSURE, float(self._manual_exposure))
@@ -288,7 +344,6 @@ class AndroidCameraStreamAdapter(CameraBackend):
             source_kind="android",
             is_depth=False,
         )
-        # Drop oldest frame if consumer is slower than producer to stay low-latency
         if self._queue.full():
             try:
                 self._queue.get_nowait()
@@ -314,6 +369,9 @@ class AndroidCameraStreamAdapter(CameraBackend):
                 break
 
 
+SyntheticScene = Literal["empty", "open_palm", "pinch", "point", "fist"]
+
+
 class SyntheticCamera(CameraBackend):
     """Procedural 2D RGB camera generating realistic test silhouettes for automated tests."""
 
@@ -323,7 +381,9 @@ class SyntheticCamera(CameraBackend):
         self._fps = fps
         self._opened = False
         self._frame_index = 0
-        self._scene: Literal["empty", "open_palm", "pinch"] = "empty"
+        self._scene: SyntheticScene = "empty"
+        self._hand_nx: float = 0.5
+        self._hand_ny: float = 0.62
 
     @property
     def capabilities(self) -> CameraCapabilities:
@@ -341,8 +401,18 @@ class SyntheticCamera(CameraBackend):
     def is_opened(self) -> bool:
         return self._opened
 
-    def set_scene(self, scene: Literal["empty", "open_palm", "pinch"]) -> None:
+    def set_scene(
+        self,
+        scene: SyntheticScene,
+        *,
+        hand_nx: float | None = None,
+        hand_ny: float | None = None,
+    ) -> None:
         self._scene = scene
+        if hand_nx is not None:
+            self._hand_nx = min(0.85, max(0.15, float(hand_nx)))
+        if hand_ny is not None:
+            self._hand_ny = min(0.85, max(0.25, float(hand_ny)))
 
     def open(self) -> bool:
         self._opened = True
@@ -352,33 +422,37 @@ class SyntheticCamera(CameraBackend):
     def read(self) -> CameraFrame | None:
         if not self._opened:
             return None
-        # Dark blue-gray studio background (non-skin in YCrCb)
         img = np.full((self._height, self._width, 3), (45, 32, 24), dtype=np.uint8)
-        # Warm skin tone in BGR that cleanly falls in standard YCrCb skin bounds
         skin_bgr = (128, 168, 224)
 
-        cx = self._width // 2
-        cy = int(self._height * 0.62)
+        cx = int(self._width * self._hand_nx)
+        cy = int(self._height * self._hand_ny)
 
         if self._scene == "open_palm":
-            # Palm circle + 5 radially spread fingers creating 4 clear convexity defects
             cv2.circle(img, (cx, cy), 30, skin_bgr, thickness=-1)
             finger_specs = [
-                ((-22, -4), (-64, -30)),   # thumb
-                ((-18, -22), (-42, -76)),  # index
-                ((0, -26), (0, -86)),      # middle
-                ((18, -22), (42, -76)),    # ring
-                ((22, -6), (62, -40)),     # pinky
+                ((-22, -4), (-64, -30)),
+                ((-18, -22), (-42, -76)),
+                ((0, -26), (0, -86)),
+                ((18, -22), (42, -76)),
+                ((22, -6), (62, -40)),
             ]
             for (sx, sy), (ex, ey) in finger_specs:
                 cv2.line(img, (cx + sx, cy + sy), (cx + ex, cy + ey), skin_bgr, thickness=9)
                 cv2.circle(img, (cx + ex, cy + ey), 5, skin_bgr, thickness=-1)
         elif self._scene == "pinch":
-            # Compact palm with thumb and index pinched together into a narrow top apex
             cv2.circle(img, (cx, cy + 8), 30, skin_bgr, thickness=-1)
             cv2.line(img, (cx - 14, cy - 6), (cx - 3, cy - 52), skin_bgr, thickness=9)
             cv2.line(img, (cx + 14, cy - 6), (cx + 3, cy - 52), skin_bgr, thickness=9)
             cv2.circle(img, (cx, cy - 54), 6, skin_bgr, thickness=-1)
+        elif self._scene == "point":
+            # Palm + single tall straight index finger pointing upward
+            cv2.circle(img, (cx, cy + 12), 26, skin_bgr, thickness=-1)
+            cv2.line(img, (cx, cy - 10), (cx, cy - 84), skin_bgr, thickness=10)
+            cv2.circle(img, (cx, cy - 86), 5, skin_bgr, thickness=-1)
+        elif self._scene == "fist":
+            # Compact closed fist (high solidity, near-square aspect ratio, no extended fingers)
+            cv2.ellipse(img, (cx, cy), (34, 30), 0, 0, 360, skin_bgr, thickness=-1)
 
         self._frame_index += 1
         return CameraFrame(
@@ -391,6 +465,86 @@ class SyntheticCamera(CameraBackend):
 
     def close(self) -> None:
         self._opened = False
+
+
+class ThreadedCameraReader:
+    """Reads frames from any CameraBackend on a dedicated daemon thread so Qt never blocks."""
+
+    def __init__(self, camera: CameraBackend, *, max_poll_hz: float = 60.0) -> None:
+        self._camera = camera
+        self._min_interval = 1.0 / max(1.0, float(max_poll_hz))
+        self._lock = threading.Lock()
+        self._latest_frame: CameraFrame | None = None
+        self._latest_seq: int = 0
+        self._fps: float = 0.0
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    @property
+    def camera(self) -> CameraBackend:
+        return self._camera
+
+    @property
+    def is_running(self) -> bool:
+        return self._running and self._camera.is_opened
+
+    @property
+    def fps(self) -> float:
+        with self._lock:
+            return self._fps
+
+    def start(self) -> bool:
+        if self._running:
+            return True
+        if not self._camera.is_opened and not self._camera.open():
+            return False
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, name="gcs-camera-reader", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._running = False
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+        self._thread = None
+        self._camera.close()
+
+    def get_latest(self, last_seen_seq: int = 0) -> tuple[CameraFrame | None, int]:
+        """Return `(frame, seq)` if a newer frame arrived since `last_seen_seq`, else `(None, seq)`."""
+        with self._lock:
+            if self._latest_frame is None or self._latest_seq <= last_seen_seq:
+                return None, self._latest_seq
+            return self._latest_frame, self._latest_seq
+
+    def _loop(self) -> None:
+        fps_frames = 0
+        fps_window_start = time.monotonic()
+        while self._running:
+            t0 = time.monotonic()
+            frame = self._camera.read()
+            if frame is not None:
+                fps_frames += 1
+                now = time.monotonic()
+                elapsed_win = now - fps_window_start
+                new_fps: float | None = None
+                if elapsed_win >= 0.5:
+                    new_fps = fps_frames / elapsed_win
+                    fps_frames = 0
+                    fps_window_start = now
+                with self._lock:
+                    self._latest_frame = frame
+                    self._latest_seq += 1
+                    if new_fps is not None:
+                        self._fps = new_fps
+            else:
+                time.sleep(0.01)
+                continue
+
+            elapsed = time.monotonic() - t0
+            sleep_for = self._min_interval - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
 
 def create_camera(

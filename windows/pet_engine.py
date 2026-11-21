@@ -338,6 +338,36 @@ class PetEngine:
         self.state = "SLEEPING"
         self.animation = "sleep"
 
+    @property
+    def is_dragging(self) -> bool:
+        return self._dragging
+
+    def guide_toward_x(self, target_x: float) -> None:
+        """Steer the pet smoothly toward a desktop X coordinate (used by POINT gesture)."""
+        if not self.is_owner or self._dragging or self.state == "HANDOFF_PENDING" or self._airborne:
+            return
+        self.state = "ACTIVE"
+        self._idle_elapsed = 0.0
+        pet_center_x = self.x + self.pet_width / 2.0
+        delta = target_x - pet_center_x
+        beh = self.config.behavior
+        if abs(delta) < max(24.0, self.pet_width * 0.25):
+            self.vx = 0.0
+            self.animation = "idle"
+            self._behavior_timer = 1.5
+            return
+
+        direction = 1.0 if delta > 0 else -1.0
+        self.facing = "right" if direction > 0 else "left"
+        if abs(delta) > 260.0:
+            self.vx = direction * beh.run_speed_px_per_sec
+            self.animation = "run"
+        else:
+            self.vx = direction * beh.walk_speed_px_per_sec
+            self.animation = "walk"
+        # Prevent autonomous AI from immediately overriding the user's hand guidance
+        self._behavior_timer = 1.2
+
     def wake_up(self) -> None:
         """Wake the pet back into active idle state."""
         if not self.is_owner or self.state == "HANDOFF_PENDING":

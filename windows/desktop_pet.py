@@ -3,7 +3,8 @@
 Connects:
 - Stage 1: PetEngine + AnimationController + TransparentPetWindow (frameless, pixel-perfect, multi-monitor)
 - Stage 2 & 4: GCS Local Hub WebSocket client + two-phase cross-device handoff UI & edge drag
-- Stage 6: Optional camera gesture confirmation (confirmation-only, never initiates handoff)
+- Stage 6: Real-time 2D RGB camera gesture control (pinch-drag, point-call, palm-wake/jump, fist-sleep,
+           and confirmation-only incoming handoff acceptance) + live Camera & Gestures HUD
 """
 
 from __future__ import annotations
@@ -11,17 +12,24 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from PySide6.QtCore import QObject, QTimer
-from PySide6.QtGui import QAction, QGuiApplication, QIcon
+from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout
 
 from server.hub import build_pairing_uri, render_pairing_qr_ascii, save_pairing_qr_png
 from shared.config_loader import AvatarConfig, load_avatar_config, load_protocol_config
 from windows.animations import AnimationController
-from windows.camera import CameraBackend
-from windows.hand_detection import HandoffGestureConfirmationController
+from windows.camera import CameraBackend, CameraFrame, PS3EyeCamera, ThreadedCameraReader, create_camera
+from windows.camera_preview import CameraPreviewWindow
+from windows.gesture_controller import GesturePetController
+from windows.hand_detection import (
+    GestureRecognizer,
+    HandoffGestureConfirmationController,
+    create_best_hand_detector,
+    draw_hand_overlay,
+)
 from windows.network_client import EmbeddedHubRunner, HubClientEvent, WindowsHubClient
 from windows.pet_engine import EdgeHandoffEvent, PetEngine
 from windows.transparent_window import (
@@ -47,8 +55,6 @@ class PairingDialog(QDialog):
         uri_lbl.setWordWrap(True)
 
         qr_lbl = QLabel()
-        from PySide6.QtGui import QPixmap
-
         pix = QPixmap(str(qr_png_path))
         if not pix.isNull():
             qr_lbl.setPixmap(pix)
@@ -60,7 +66,7 @@ class PairingDialog(QDialog):
 
 
 class DesktopPetApp(QObject):
-    """Coordinates the Windows desktop pet window, physics, Hub sync, and handoff flows."""
+    """Coordinates the Windows desktop pet window, physics, Hub sync, handoff, and live gestures."""
 
     def __init__(
         self,
@@ -73,6 +79,8 @@ class DesktopPetApp(QObject):
         hub_port: int = 8765,
         enable_mdns: bool = True,
         camera: CameraBackend | None = None,
+        show_camera_preview: bool = True,
+        hand_model_path: Path | None = None,
     ) -> None:
         super().__init__()
         self.qt_app = qt_app
@@ -111,6 +119,7 @@ class DesktopPetApp(QObject):
         self._window.request_scale_delta.connect(self._adjust_scale)
         self._window.request_toggle_sleep.connect(self._toggle_sleep)
         self._window.request_show_pairing.connect(self.show_pairing_dialog)
+        self._window.request_toggle_camera_hud.connect(self.toggle_camera_preview)
         self._window.request_quit.connect(self.shutdown)
 
         # Incoming handoff prompt overlay
@@ -131,15 +140,56 @@ class DesktopPetApp(QObject):
         self._last_sync_sent: float = 0.0
         self._last_save_time: float = time.monotonic()
 
-        # Optional Stage 6 camera gesture confirmation (confirmation ONLY)
-        self._camera = camera
+        # Real-time camera capture & gesture control pipeline
+        self._camera_reader: ThreadedCameraReader | None = None
+        self._camera_kind: str = camera.capabilities.device_kind if camera is not None else "none"
+        self._ps3_mode: Literal["vga_60", "qvga_120", "vga_30"] = (
+            camera.mode if isinstance(camera, PS3EyeCamera) else "vga_60"  # type: ignore[assignment]
+        )
+        self._last_camera_seq: int = 0
+        self._last_camera_frame: CameraFrame | None = None
+        self._last_preview_draw: float = 0.0
+        self._camera_preview: CameraPreviewWindow | None = None
+
+        self._hand_detector = create_best_hand_detector(model_path=hand_model_path)
+        self._gesture_recognizer = GestureRecognizer(detector=self._hand_detector, hold_frames=3)
         self._gesture_confirm = HandoffGestureConfirmationController(
+            recognizer=self._gesture_recognizer,
             on_confirm_handoff=self._confirm_incoming_handoff,
         )
-        if self._camera is not None:
-            if not self._camera.open():
-                logger.warning("Camera backend could not be opened; continuing with click confirmation only.")
-                self._camera = None
+        self._gesture_controller = GesturePetController(
+            self._engine,
+            self._gesture_recognizer,
+            self._gesture_confirm,
+            on_pet_state_changed=lambda: self._push_state_to_hub(force=True),
+        )
+
+        if camera is not None:
+            reader = ThreadedCameraReader(camera, max_poll_hz=30.0)
+            if reader.start():
+                self._camera_reader = reader
+                cam_idx = getattr(camera, "device_index", 0)
+                self._camera_preview = CameraPreviewWindow(
+                    camera_kind=self._camera_kind,
+                    camera_index=cam_idx,
+                    tracker_name=self._hand_detector.name,
+                )
+                self._camera_preview.request_calibrate_bg.connect(self._calibrate_camera_background)
+                self._camera_preview.request_clear_bg.connect(self._clear_camera_background)
+                self._camera_preview.request_toggle_pause.connect(self._set_gestures_paused)
+                self._camera_preview.request_switch_camera_index.connect(self._switch_camera_index)
+                if show_camera_preview:
+                    self._camera_preview.show()
+                logger.info(
+                    "Live gesture control active (camera=%s, tracker=%s)",
+                    self._camera_kind,
+                    self._hand_detector.name,
+                )
+            else:
+                logger.warning(
+                    "Could not open camera (%s). Try --list-cameras or --camera-index 1. Continuing without camera.",
+                    self._camera_kind,
+                )
 
         if not self.standalone:
             resolved_url = hub_url
@@ -158,8 +208,8 @@ class DesktopPetApp(QObject):
 
             primary = bounds.primary_screen
             capabilities = ["desktop_pet", "mouse_drag", "click_confirm"]
-            if self._camera is not None:
-                capabilities.append("camera_gesture_confirm")
+            if self._camera_reader is not None:
+                capabilities.extend(["camera_gesture_control", "camera_gesture_confirm"])
 
             self._ws_client = WindowsHubClient(
                 resolved_url,
@@ -201,6 +251,11 @@ class DesktopPetApp(QObject):
         handoff_action.triggered.connect(self._trigger_manual_handoff)
         menu.addAction(handoff_action)
 
+        if self._camera_preview is not None:
+            cam_action = QAction("Show Camera & Gestures HUD", menu)
+            cam_action.triggered.connect(self.toggle_camera_preview)
+            menu.addAction(cam_action)
+
         menu.addSeparator()
         quit_action = QAction("Quit", menu)
         quit_action.triggered.connect(self.shutdown)
@@ -209,6 +264,53 @@ class DesktopPetApp(QObject):
         tray.setContextMenu(menu)
         tray.show()
         return tray
+
+    def toggle_camera_preview(self) -> None:
+        if self._camera_preview is None:
+            return
+        if self._camera_preview.isVisible():
+            self._camera_preview.hide()
+        else:
+            self._camera_preview.show()
+            self._camera_preview.raise_()
+
+    def _calibrate_camera_background(self) -> None:
+        if self._last_camera_frame is None:
+            return
+        if self._hand_detector.calibrate_background(self._last_camera_frame.frame_bgr):
+            if self._camera_preview is not None:
+                self._camera_preview.set_status_text("Background calibrated! Move your hand into view.")
+        elif self._camera_preview is not None:
+            self._camera_preview.set_status_text(f"Tracker '{self._hand_detector.name}' does not need BG calibration.")
+
+    def _clear_camera_background(self) -> None:
+        self._hand_detector.clear_background()
+        if self._camera_preview is not None:
+            self._camera_preview.set_status_text("Background calibration cleared.")
+
+    def _set_gestures_paused(self, paused: bool) -> None:
+        self._gesture_controller.paused = paused
+
+    def _switch_camera_index(self, new_index: int) -> None:
+        if self._camera_kind not in ("webcam", "ps3_eye"):
+            return
+        if self._camera_reader is not None:
+            self._camera_reader.stop()
+            self._camera_reader = None
+        new_cam = create_camera(
+            self._camera_kind,  # type: ignore[arg-type]
+            device_index=new_index,
+            ps3_mode=self._ps3_mode,
+        )
+        new_reader = ThreadedCameraReader(new_cam, max_poll_hz=30.0)
+        if new_reader.start():
+            self._camera_reader = new_reader
+            self._last_camera_seq = 0
+            self._hand_detector.clear_background()
+            if self._camera_preview is not None:
+                self._camera_preview.set_status_text(f"Switched to {self._camera_kind} index {new_index}")
+        elif self._camera_preview is not None:
+            self._camera_preview.set_status_text(f"Failed to open camera index {new_index}")
 
     def _refresh_monitors(self, *_args: object) -> None:
         self._engine.update_desktop_bounds(query_qt_desktop_bounds())
@@ -311,11 +413,30 @@ class DesktopPetApp(QObject):
             for event in self._ws_client.drain_events():
                 self._handle_hub_event(event)
 
-        # Optional Stage 6 camera polling ONLY while an incoming handoff offer is armed
-        if self._camera is not None and self._gesture_confirm.pending_handoff_id is not None:
-            cam_frame = self._camera.read()
+        # Real-time camera & gesture processing on every new frame
+        if self._camera_reader is not None:
+            cam_frame, new_seq = self._camera_reader.get_latest(self._last_camera_seq)
             if cam_frame is not None:
-                self._gesture_confirm.process_frame(cam_frame)
+                self._last_camera_seq = new_seq
+                self._last_camera_frame = cam_frame
+                update = self._gesture_controller.process_frame(cam_frame)
+
+                # Update live HUD preview window (~30 FPS)
+                if (
+                    self._camera_preview is not None
+                    and self._camera_preview.isVisible()
+                    and (now - self._last_preview_draw) >= 0.032
+                ):
+                    self._last_preview_draw = now
+                    annotated = draw_hand_overlay(
+                        cam_frame.frame_bgr,
+                        update.event,
+                        active_action=update.active_action,
+                        fps=self._camera_reader.fps,
+                        show_mask=self._camera_preview.show_mask,
+                        handoff_armed=(self._gesture_confirm.pending_handoff_id is not None),
+                    )
+                    self._camera_preview.update_frame(annotated, status_text=update.active_action)
 
         # Advance physics & animations
         self._engine.tick(dt)
@@ -330,6 +451,7 @@ class DesktopPetApp(QObject):
             self._window.set_context_state(
                 is_sleeping=(self._engine.state == "SLEEPING"),
                 can_handoff=self._has_online_peer(),
+                has_camera=(self._camera_preview is not None),
             )
             self._render_current_frame()
             self._window.move_to(self._engine.x, self._engine.y)
@@ -439,17 +561,21 @@ class DesktopPetApp(QObject):
             self._engine.is_visible = False
 
     def shutdown(self) -> None:
-        """Persist position and stop timers, camera, WebSocket client, and embedded Hub."""
+        """Persist position and stop timers, camera, detector, WebSocket client, and embedded Hub."""
         logger.info("Shutting down GCS Shimeji Windows client...")
         self._timer.stop()
         if self._engine.is_owner:
             self._engine.save_position(scale=self._anim.sprite_sheet.scale)
-        if self._camera is not None:
-            self._camera.close()
+        if self._camera_reader is not None:
+            self._camera_reader.stop()
+            self._camera_reader = None
+        self._hand_detector.close()
         if self._ws_client is not None:
             self._ws_client.stop_background()
         if self._embedded_hub is not None:
             self._embedded_hub.stop()
+        if self._camera_preview is not None:
+            self._camera_preview.deleteLater()
         self._handoff_overlay.close()
         self._window.close()
         if self._tray is not None:
