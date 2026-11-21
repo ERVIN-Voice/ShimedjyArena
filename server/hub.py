@@ -32,6 +32,7 @@ from server.avatar_state import (
 )
 from server.device_manager import DeviceError, DeviceManager
 from server.handoff_manager import HandoffError, HandoffManager, HandoffOutcome
+from server.web_server import LocalWebServer
 from shared.config_loader import ProtocolConfig, load_protocol_config, make_envelope
 
 logger = logging.getLogger(__name__)
@@ -62,19 +63,27 @@ def detect_local_ip() -> str:
     return "127.0.0.1"
 
 
-def build_pairing_uri(host: str, port: int, protocol: ProtocolConfig | None = None) -> str:
-    """Build a QR-scannable local pairing URI for Android manual connection."""
+def build_pairing_uri(
+    host: str,
+    port: int,
+    protocol: ProtocolConfig | None = None,
+    *,
+    web_port: int | None = None,
+) -> str:
+    """Build a QR-scannable local pairing URI for Android manual/WebView connection."""
     proto = protocol or load_protocol_config()
     display_host = detect_local_ip() if host in ("0.0.0.0", "", "::") else host
     ws_url = f"ws://{display_host}:{port}"
-    query = urlencode(
-        {
-            "ws": ws_url,
-            "host": display_host,
-            "port": str(port),
-            "protocol": proto.protocol_version,
-        }
-    )
+    params: dict[str, str] = {
+        "ws": ws_url,
+        "host": display_host,
+        "port": str(port),
+        "protocol": proto.protocol_version,
+    }
+    if web_port is not None and web_port > 0:
+        params["web"] = f"http://{display_host}:{web_port}"
+        params["web_port"] = str(web_port)
+    query = urlencode(params)
     return f"{proto.qr_scheme}?{query}"
 
 
@@ -120,10 +129,11 @@ class _MessageIdDeduplicator:
 class _MDNSAdvertiser:
     """Optional mDNS/Zeroconf service advertiser for LAN auto-discovery."""
 
-    def __init__(self, protocol: ProtocolConfig, host: str, port: int) -> None:
+    def __init__(self, protocol: ProtocolConfig, host: str, port: int, web_port: int | None = None) -> None:
         self._protocol = protocol
         self._host = host
         self._port = port
+        self._web_port = web_port
         self._aiozc: Any = None
         self._service_info: Any = None
 
@@ -138,16 +148,20 @@ class _MDNSAdvertiser:
             service_type = self._protocol.mdns_service_type
             service_name = f"{self._protocol.mdns_service_name}-{hostname}.{service_type}"
 
+            props = {
+                "protocol": self._protocol.protocol_version,
+                "hub_version": HUB_VERSION,
+                "ws_path": "/",
+            }
+            if self._web_port is not None and self._web_port > 0:
+                props["web_port"] = str(self._web_port)
+
             self._service_info = ServiceInfo(
                 type_=service_type,
                 name=service_name,
                 addresses=[packed_ip],
                 port=self._port,
-                properties={
-                    "protocol": self._protocol.protocol_version,
-                    "hub_version": HUB_VERSION,
-                    "ws_path": "/",
-                },
+                properties=props,
                 server=f"{hostname}.local.",
             )
             self._aiozc = AsyncZeroconf()
@@ -185,12 +199,20 @@ class GCSLocalHub:
         handoff_timeout_seconds: float | None = None,
         enforce_timeout_bounds: bool = True,
         enable_mdns: bool = True,
+        enable_web: bool = True,
+        web_port: int | None = None,
     ) -> None:
         self.protocol = protocol or load_protocol_config()
         self.host = host if host is not None else self.protocol.default_host
         self.requested_port = port if port is not None else self.protocol.default_port
         self.actual_port: int = self.requested_port
         self.enable_mdns = enable_mdns
+        self.enable_web = enable_web
+        if web_port is not None:
+            self.requested_web_port = web_port
+        else:
+            self.requested_web_port = 0 if self.requested_port == 0 else (self.requested_port + 1)
+        self.actual_web_port: int = self.requested_web_port
 
         self.state_store = AvatarStateStore(self.protocol)
         self.device_manager = DeviceManager(self.protocol)
@@ -205,6 +227,7 @@ class GCSLocalHub:
 
         self._dedup = _MessageIdDeduplicator(max_entries=2048)
         self._server: Server | None = None
+        self._web_server: LocalWebServer | None = None
         self._mdns: _MDNSAdvertiser | None = None
         self._running: bool = False
 
@@ -218,11 +241,21 @@ class GCSLocalHub:
         return f"ws://{connect_host}:{self.actual_port}"
 
     @property
+    def web_url(self) -> str:
+        display_host = detect_local_ip() if self.host in ("0.0.0.0", "", "::") else self.host
+        return f"http://{display_host}:{self.actual_web_port}"
+
+    @property
     def pairing_uri(self) -> str:
-        return build_pairing_uri(self.host, self.actual_port, self.protocol)
+        return build_pairing_uri(
+            self.host,
+            self.actual_port,
+            self.protocol,
+            web_port=self.actual_web_port if self.enable_web else None,
+        )
 
     async def start(self) -> None:
-        """Start the WebSocket server and optional mDNS advertisement."""
+        """Start the WebSocket server, embedded local Web Client server, and optional mDNS."""
         if self._running:
             return
         self._server = await websockets.serve(
@@ -236,16 +269,37 @@ class GCSLocalHub:
         sockets = self._server.sockets
         if sockets:
             self.actual_port = int(sockets[0].getsockname()[1])
+
+        if self.enable_web:
+            self._web_server = LocalWebServer(
+                host=self.host,
+                port=self.requested_web_port,
+                ws_port_provider=lambda: self.actual_port,
+            )
+            await self._web_server.start()
+            self.actual_web_port = self._web_server.bound_port
+
         self._running = True
 
         if self.enable_mdns:
-            self._mdns = _MDNSAdvertiser(self.protocol, self.host, self.actual_port)
+            self._mdns = _MDNSAdvertiser(
+                self.protocol,
+                self.host,
+                self.actual_port,
+                web_port=self.actual_web_port if self.enable_web else None,
+            )
             await self._mdns.start()
 
-        logger.info("GCS Local Hub listening on %s:%d (pairing: %s)", self.host, self.actual_port, self.pairing_uri)
+        logger.info(
+            "GCS Local Hub listening on %s:%d (web: %s, pairing: %s)",
+            self.host,
+            self.actual_port,
+            self.web_url if self.enable_web else "disabled",
+            self.pairing_uri,
+        )
 
     async def stop(self) -> None:
-        """Gracefully stop mDNS, active handoff timers, and the WebSocket server."""
+        """Gracefully stop mDNS, Web server, active handoff timers, and the WebSocket server."""
         if not self._running:
             return
         self._running = False
@@ -254,6 +308,10 @@ class GCSLocalHub:
         if self._mdns is not None:
             await self._mdns.stop()
             self._mdns = None
+
+        if self._web_server is not None:
+            await self._web_server.stop()
+            self._web_server = None
 
         if self._server is not None:
             self._server.close()
@@ -674,6 +732,8 @@ async def _run_hub_cli(args: argparse.Namespace) -> None:
         port=args.port,
         handoff_timeout_seconds=args.handoff_timeout,
         enable_mdns=not args.no_mdns,
+        enable_web=not args.no_web,
+        web_port=args.web_port,
     )
     await hub.start()
 
@@ -681,6 +741,8 @@ async def _run_hub_cli(args: argparse.Namespace) -> None:
     display_host = detect_local_ip() if args.host in ("0.0.0.0", "", "::") else args.host
     print("\n=== GCS Local Hub Started ===")
     print(f"WebSocket URL : ws://{display_host}:{hub.actual_port}")
+    if hub.enable_web:
+        print(f"Web Client URL: http://{display_host}:{hub.actual_web_port}")
     print(f"Pairing URI   : {uri}")
     if args.qr:
         print(render_pairing_qr_ascii(uri))
@@ -712,6 +774,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the GCS Shimeji Local Hub server.")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8765, help="WebSocket port (default: 8765)")
+    parser.add_argument("--web-port", type=int, default=None, help="Local Web Client HTTP port (default: port + 1, i.e. 8766)")
+    parser.add_argument("--no-web", action="store_true", help="Disable embedded local Web Client HTTP server")
     parser.add_argument(
         "--handoff-timeout",
         type=float,

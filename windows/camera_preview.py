@@ -18,14 +18,19 @@ from PySide6.QtWidgets import (
 )
 
 
-def bgr_to_qpixmap(frame_bgr: np.ndarray, target_width: int = 480) -> QPixmap:
-    """Convert an OpenCV BGR ndarray into a scaled QPixmap."""
+def bgr_to_qpixmap(frame_bgr: np.ndarray, target_width: int = 480, target_height: int = 360) -> QPixmap:
+    """Convert an OpenCV BGR ndarray into a scaled QPixmap preserving aspect ratio without cropping."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
     qimg = QImage(rgb.data, w, h, w * ch, QImage.Format.Format_RGB888).copy()
     pix = QPixmap.fromImage(qimg)
-    if w != target_width and target_width > 0:
-        return pix.scaledToWidth(target_width, Qt.TransformationMode.FastTransformation)
+    if target_width > 0 and target_height > 0:
+        return pix.scaled(
+            target_width,
+            target_height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
     return pix
 
 
@@ -53,6 +58,7 @@ class CameraPreviewWindow(QWidget):
         camera_kind: str = "webcam",
         camera_index: int = 0,
         tracker_name: str = "opencv_2d",
+        tracker_note: str = "",
     ) -> None:
         super().__init__(None)
         self._show_mask: bool = False
@@ -100,11 +106,14 @@ class CameraPreviewWindow(QWidget):
 
         self._video_label = QLabel("Waiting for camera frames...")
         self._video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._video_label.setMinimumSize(480, 340)
+        self._video_label.setFixedSize(480, 360)
         self._video_label.setStyleSheet("background-color: #080b12; border: 1px solid #2b3c58; border-radius: 6px;")
         root.addWidget(self._video_label)
 
-        self._status_label = QLabel(f"Tracker: {tracker_name} | Ready")
+        init_status = f"Tracker: {tracker_name}"
+        if tracker_note:
+            init_status += f" ({tracker_note})"
+        self._status_label = QLabel(init_status)
         self._status_label.setStyleSheet("color: #66fcf1; font-weight: bold;")
         root.addWidget(self._status_label)
 
@@ -175,7 +184,7 @@ class CameraPreviewWindow(QWidget):
     def update_frame(self, annotated_bgr: np.ndarray, status_text: str | None = None) -> None:
         if not self.isVisible():
             return
-        self._video_label.setPixmap(bgr_to_qpixmap(annotated_bgr, target_width=480))
+        self._video_label.setPixmap(bgr_to_qpixmap(annotated_bgr, target_width=480, target_height=360))
         if status_text is not None:
             self._status_label.setText(status_text)
 

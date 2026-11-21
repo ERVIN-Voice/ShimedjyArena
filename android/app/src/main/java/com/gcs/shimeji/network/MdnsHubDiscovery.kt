@@ -12,8 +12,10 @@ data class DiscoveredHub(
     val serviceName: String,
     val host: String,
     val port: Int,
+    val webPort: Int = port + 1,
 ) {
     val wsUrl: String get() = "ws://$host:$port"
+    val webUrl: String get() = "http://$host:$webPort"
 }
 
 /**
@@ -54,15 +56,19 @@ class MdnsHubDiscovery(context: Context) {
 
                         override fun onServiceResolved(info: NsdServiceInfo) {
                             val hostAddress = info.host?.hostAddress ?: return
+                            val txtWebPort = runCatching {
+                                info.attributes["web_port"]?.decodeToString()?.toIntOrNull()
+                            }.getOrNull()
                             val found = DiscoveredHub(
                                 serviceName = info.serviceName,
                                 host = hostAddress,
                                 port = info.port,
+                                webPort = txtWebPort ?: (info.port + 1),
                             )
                             val updated = _hubs.value
                                 .filterNot { it.serviceName == found.serviceName } + found
                             _hubs.value = updated
-                            Log.i(TAG, "Resolved Hub via mDNS: ${found.wsUrl}")
+                            Log.i(TAG, "Resolved Hub via mDNS: ws=${found.wsUrl}, web=${found.webUrl}")
                         }
                     }
                 )

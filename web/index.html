@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1420" />
+  <title>GCS Shimeji — Android Companion</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="top-bar">
+      <div class="brand">
+        <span class="title">GCS Shimeji</span>
+        <span id="deviceLabel" class="subtitle">connecting...</span>
+      </div>
+      <div class="status-group">
+        <span id="statusBadge" class="badge offline">
+          <span class="dot"></span>
+          <span id="statusText">OFFLINE</span>
+        </span>
+      </div>
+    </header>
+
+    <div id="banner" class="status-banner">Connecting to GCS Local Hub...</div>
+
+    <main id="stage" class="stage">
+      <div id="edgeLeft" class="edge-glow edge-left"></div>
+      <div id="edgeRight" class="edge-glow edge-right"></div>
+      <div id="edgeTop" class="edge-glow edge-top"></div>
+
+      <canvas id="petCanvas"></canvas>
+
+      <div id="emptyOverlay" class="center-card hidden">
+        <div id="emptyTitle" class="center-title">Waiting for Pet</div>
+        <div id="emptyHint" class="center-hint">
+          Drag the pet to your Windows monitor edge (or right-click → Send to Android).
+        </div>
+      </div>
+
+      <div id="offerOverlay" class="offer-overlay hidden">
+        <div class="offer-card" id="offerCard">
+          <div class="offer-title">Incoming Pixel Companion!</div>
+          <div id="offerSubtitle" class="offer-sub">From Windows PC — 6.0s left</div>
+          <div class="progress-track">
+            <div id="offerProgress" class="progress-fill"></div>
+          </div>
+          <div class="offer-actions">
+            <button id="acceptBtn" class="btn btn-mint" type="button">Tap to Receive</button>
+            <button id="declineBtn" class="btn btn-outline" type="button">Decline</button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <footer class="bottom-bar">
+      <div class="meta">
+        <span id="metaInfo">Peers: 0 | Anim: idle</span>
+      </div>
+      <div class="actions">
+        <button id="jumpBtn" class="btn btn-outline" type="button">Jump</button>
+        <button id="sendBtn" class="btn btn-cyan" type="button" disabled>Send to Windows</button>
+      </div>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

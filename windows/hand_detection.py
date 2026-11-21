@@ -1,13 +1,14 @@
 """Real-time 2D RGB hand detection, multi-gesture recognition, and confirmation-only
 handoff safety gate for non-depth cameras (PS3 Eye, standard webcams, Android RGB).
 
-Engineered specifically to work reliably on low-quality / dim / noisy cameras (such as PS3 Eye)
+Engineered specifically for low-quality / dim / noisy cameras (such as PS3 Eye)
 without confusing the user's face or torso with their hand:
-1. MediaPipeHandDetector (21-keypoint local neural hand landmarker in VIDEO tracking mode +
+1. MediaPipeHandDetector (21-keypoint local neural hand landmarker loaded via
+   model_asset_buffer for full Windows path compatibility, VIDEO tracking mode +
    low-light CLAHE/gamma enhancement) — never mistakes a face/body for a hand.
-2. OpenCVHandDetector (offline zero-download fallback) — YCrCb+HSV adaptive skin filter +
-   motion persistence scoring + torso/face blob rejection + user/background subtraction +
-   optional active hand ROI box.
+2. OpenCVHandDetector (offline zero-download fallback) — denoised YCrCb+HSV skin
+   filter (no CLAHE wall-shift!), calibrated "Ignore Me + BG" subtraction,
+   motion-persistence scoring, torso/face rejection, and optional active hand ROI.
 """
 
 from __future__ import annotations
@@ -32,12 +33,17 @@ from windows.camera import CameraFrame
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEDIAPIPE_MODEL_PATH = PROJECT_ROOT / "assets" / "models" / "hand_landmarker.task"
-MEDIAPIPE_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/"
-    "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+MEDIAPIPE_MODEL_URLS: tuple[str, ...] = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
 )
 
-# Standard MediaPipe 21-landmark hand skeleton connections for HUD rendering
+# Default offline OpenCV skin thresholds (tuned to reject pale/beige/gray walls)
+DEFAULT_YCRCB_LOWER = (0, 138, 77)
+DEFAULT_YCRCB_UPPER = (255, 173, 127)
+DEFAULT_HSV_LOWER = (0, 58, 45)
+DEFAULT_HSV_UPPER = (26, 255, 255)
+
 HAND_CONNECTIONS: tuple[tuple[int, int], ...] = (
     (0, 1), (1, 2), (2, 3), (3, 4),          # Thumb
     (0, 5), (5, 6), (6, 7), (7, 8),          # Index
@@ -47,25 +53,25 @@ HAND_CONNECTIONS: tuple[tuple[int, int], ...] = (
 )
 
 _CLAHE = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+_LAST_MEDIAPIPE_STATUS: str = ""
+
+
+def get_last_mediapipe_status() -> str:
+    """Return diagnostic status from the most recent MediaPipe initialization attempt."""
+    return _LAST_MEDIAPIPE_STATUS
 
 
 def enhance_low_quality_frame(frame_bgr: np.ndarray) -> np.ndarray:
-    """Enhance dim, noisy, low-contrast frames (typical of PS3 Eye indoors).
-
-    Applies lightweight denoise + adaptive gamma lift (only if dark) + LAB CLAHE
-    contrast enhancement so hand edges & fingers stand out cleanly.
-    """
+    """Enhance dim, noisy, low-contrast frames for neural hand tracking (PS3 Eye indoors)."""
     if frame_bgr is None or frame_bgr.size == 0 or frame_bgr.ndim != 3:
         return frame_bgr
 
-    # Gentle denoise removes PS3 Eye sensor grain without smearing fingers
     denoised = cv2.GaussianBlur(frame_bgr, (3, 3), 0)
     lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
 
     mean_l = float(np.mean(l_ch))
     if mean_l < 95.0:
-        # Lift dark rooms smoothly via gamma LUT
         gamma = max(0.45, min(0.88, (mean_l + 25.0) / 130.0))
         lut = np.array([min(255, int(((i / 255.0) ** gamma) * 255.0)) for i in range(256)], dtype=np.uint8)
         l_ch = cv2.LUT(l_ch, lut)
@@ -79,41 +85,52 @@ def ensure_mediapipe_model(
     target_path: Path = DEFAULT_MEDIAPIPE_MODEL_PATH,
     *,
     allow_download: bool = True,
-    timeout_seconds: float = 15.0,
+    timeout_seconds: float = 20.0,
 ) -> Path | None:
     """Return local path to hand_landmarker.task, optionally fetching it once for offline use."""
+    global _LAST_MEDIAPIPE_STATUS
     if target_path.exists() and target_path.stat().st_size > 100_000:
+        _LAST_MEDIAPIPE_STATUS = "Local MediaPipe model ready"
         return target_path
     if not allow_download:
+        _LAST_MEDIAPIPE_STATUS = "Offline mode (model not downloaded)"
         return None
 
-    # Only download if mediapipe is actually installed in this Python environment
     try:
         import mediapipe  # noqa: F401
-    except ImportError:
+    except Exception as exc:
+        _LAST_MEDIAPIPE_STATUS = f"mediapipe import failed: {exc}"
+        logger.warning("MediaPipe not available: %s", exc)
         return None
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.with_suffix(".task.tmp")
-    logger.info("Downloading local MediaPipe HandLandmarker model (~7.5 MB) to %s ...", target_path)
-    try:
-        req = urllib.request.Request(MEDIAPIPE_MODEL_URL, headers={"User-Agent": "GCS-Shimeji/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp, tmp_path.open("wb") as out:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                out.write(chunk)
-        if tmp_path.stat().st_size < 100_000:
+    last_err = ""
+    for url in MEDIAPIPE_MODEL_URLS:
+        logger.info("Downloading local MediaPipe HandLandmarker model (~7.5 MB) from %s ...", url)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "GCS-Shimeji/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp, tmp_path.open("wb") as out:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            if tmp_path.stat().st_size < 100_000:
+                tmp_path.unlink(missing_ok=True)
+                last_err = "Downloaded model file was too small"
+                continue
+            os.replace(tmp_path, target_path)
+            _LAST_MEDIAPIPE_STATUS = "Downloaded local MediaPipe model"
+            logger.info("Saved local MediaPipe model (%d bytes). Future runs are 100%% offline.", target_path.stat().st_size)
+            return target_path
+        except Exception as exc:
+            last_err = str(exc)
             tmp_path.unlink(missing_ok=True)
-            return None
-        os.replace(tmp_path, target_path)
-        logger.info("Saved local MediaPipe model (%d bytes). Future runs are 100%% offline.", target_path.stat().st_size)
-        return target_path
-    except Exception as exc:
-        logger.warning("Could not download MediaPipe model (%s); using offline OpenCV detector.", exc)
-        tmp_path.unlink(missing_ok=True)
-        return None
+
+    _LAST_MEDIAPIPE_STATUS = f"Model download failed: {last_err}"
+    logger.warning("Could not download MediaPipe model (%s); using offline OpenCV detector.", last_err)
+    return None
 
 
 class GestureType(str, Enum):
@@ -194,7 +211,7 @@ class HandDetector(ABC):
         return False
 
     def clear_background(self) -> None:
-        """Clear any calibrated background model."""
+        """Clear any calibrated background model and reset adaptive thresholds."""
 
     def close(self) -> None:
         """Release detector resources if any."""
@@ -210,13 +227,7 @@ def analyze_21_landmarks(
     *,
     tracker_name: str = "mediapipe",
 ) -> HandDetectionResult:
-    """Extract normalized palm center, extended fingers, openness, and pinch ratio from 21 hand landmarks.
-
-    Standard MediaPipe indices:
-      0=wrist, 1-4=thumb (4=tip), 5-8=index (6=PIP, 8=tip),
-      9-12=middle (10=PIP, 12=tip), 13-16=ring (14=PIP, 16=tip),
-      17-20=pinky (18=PIP, 20=tip).
-    """
+    """Extract normalized palm center, extended fingers, openness, and pinch ratio from 21 hand landmarks."""
     if len(points) != 21:
         return HandDetectionResult(detected=False, depth_available=False, tracker_name=tracker_name)
 
@@ -229,7 +240,6 @@ def analyze_21_landmarks(
 
     palm_scale = max(0.03, wrist.distance_to(pts[9]))
 
-    # Check 4 non-thumb fingers: tip significantly farther from wrist than PIP joint
     finger_pairs = ((8, 6), (12, 10), (16, 14), (20, 18))
     extended_tips: list[Point2D] = []
     extended_count = 0
@@ -244,7 +254,6 @@ def analyze_21_landmarks(
             extended_count += 1
             extended_tips.append(pts[tip_i])
 
-    # Thumb extension: distance from thumb tip (#4) to pinky MCP (#17) vs thumb IP (#3) to pinky MCP
     thumb_spread = pts[4].distance_to(pts[17])
     thumb_ip_spread = pts[3].distance_to(pts[17])
     thumb_extended = thumb_spread > thumb_ip_spread * 1.08 and pts[4].distance_to(pts[5]) > palm_scale * 0.42
@@ -252,7 +261,6 @@ def analyze_21_landmarks(
         extended_count += 1
         extended_tips.append(pts[4])
 
-    # Exact thumb-index pinch ratio normalized by palm size
     thumb_index_dist = pts[4].distance_to(pts[8])
     pinch_ratio = min(1.5, thumb_index_dist / palm_scale)
 
@@ -289,17 +297,17 @@ def analyze_21_landmarks(
 class MediaPipeHandDetector(HandDetector):
     """Offline local 21-landmark neural hand detector using MediaPipe Tasks HandLandmarker.
 
-    Uses VIDEO tracking mode + low-light CLAHE/gamma enhancement so it tracks ONLY the
-    hand (never faces or torsos) even on grainy, dimly lit PS3 Eye cameras.
+    Loads the model via `model_asset_buffer` (in-memory bytes) so Windows paths with
+    spaces, long directories, or Unicode characters NEVER fail in MediaPipe's C++ loader.
     """
 
     def __init__(
         self,
         model_path: str | Path = DEFAULT_MEDIAPIPE_MODEL_PATH,
         *,
-        min_detection_confidence: float = 0.38,
-        min_presence_confidence: float = 0.38,
-        min_tracking_confidence: float = 0.35,
+        min_detection_confidence: float = 0.35,
+        min_presence_confidence: float = 0.35,
+        min_tracking_confidence: float = 0.32,
         enhance_low_light: bool = True,
     ) -> None:
         self._model_path = Path(model_path)
@@ -318,8 +326,11 @@ class MediaPipeHandDetector(HandDetector):
         self._enhance_low_light = enhance_low_light
         self._roi: tuple[float, float, float, float] | None = None
         self._last_ts_ms: int = 0
+
+        # Passing raw bytes avoids MediaPipe C++ fopen failures on Windows paths!
+        model_bytes = self._model_path.read_bytes()
         options = HandLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(self._model_path)),
+            base_options=BaseOptions(model_asset_buffer=model_bytes),
             running_mode=RunningMode.VIDEO,
             num_hands=1,
             min_hand_detection_confidence=min_detection_confidence,
@@ -327,7 +338,7 @@ class MediaPipeHandDetector(HandDetector):
             min_tracking_confidence=min_tracking_confidence,
         )
         self._landmarker = HandLandmarker.create_from_options(options)
-        logger.info("Initialized MediaPipeHandDetector (VIDEO mode, low-light enhance=%s): %s", enhance_low_light, self._model_path)
+        logger.info("Initialized MediaPipeHandDetector (VIDEO mode, buffer=%d bytes)", len(model_bytes))
 
     @property
     def name(self) -> str:
@@ -360,7 +371,7 @@ class MediaPipeHandDetector(HandDetector):
         if self._enhance_low_light:
             work_bgr = enhance_low_quality_frame(work_bgr)
 
-        rgb = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(cv2.cvtColor(work_bgr, cv2.COLOR_BGR2RGB))
         mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
 
         ts_ms = int(frame.timestamp * 1000.0)
@@ -375,7 +386,6 @@ class MediaPipeHandDetector(HandDetector):
         raw_lms = result.hand_landmarks[0]
         rw = max(1, rx1 - rx0)
         rh = max(1, ry1 - ry0)
-        # Map cropped ROI coordinates back to full-frame normalized [0, 1] space
         points = [
             Point2D(
                 x=(rx0 + float(lm.x) * rw) / w,
@@ -395,15 +405,11 @@ class MediaPipeHandDetector(HandDetector):
 
 
 class OpenCVHandDetector(HandDetector):
-    """Offline zero-download 2D RGB hand detector engineered to avoid locking onto the user's face/body.
+    """Offline zero-download 2D RGB hand detector engineered to reject walls, sensor grain,
+    and stationary faces/torsos.
 
-    Combines:
-    - Low-light contrast enhancement (for dim/noisy PS3 Eye frames)
-    - Dual-space skin filter (YCrCb + HSV) with optional live skin calibration
-    - Calibrated "Ignore Me + Room" background subtraction
-    - Decaying motion-persistence map so moving hands strongly outscore stationary faces/torsos
-    - Multi-contour scoring that rejects body/torso-sized blobs & stationary upper-center face blobs
-    - Optional Active Hand Zone (ROI) mask
+    Notice: intentionally uses median-denoised RAW BGR (NOT CLAHE!) for color thresholding
+    so beige/warm walls do not get boosted into skin tones.
     """
 
     def __init__(
@@ -411,21 +417,20 @@ class OpenCVHandDetector(HandDetector):
         *,
         min_area_ratio: float = 0.015,
         max_area_ratio: float = 0.34,
-        ycrcb_lower: tuple[int, int, int] = (0, 133, 77),
-        ycrcb_upper: tuple[int, int, int] = (255, 173, 127),
-        bg_diff_threshold: int = 22,
+        ycrcb_lower: tuple[int, int, int] = DEFAULT_YCRCB_LOWER,
+        ycrcb_upper: tuple[int, int, int] = DEFAULT_YCRCB_UPPER,
+        bg_diff_threshold: int = 24,
         enable_face_exclusion: bool = True,
-        enhance_low_light: bool = True,
     ) -> None:
         self._min_area_ratio = min_area_ratio
         self._max_area_ratio = max_area_ratio
         self._ycrcb_lower = np.array(ycrcb_lower, dtype=np.uint8)
         self._ycrcb_upper = np.array(ycrcb_upper, dtype=np.uint8)
-        self._hsv_lower = np.array((0, 25, 40), dtype=np.uint8)
-        self._hsv_upper = np.array((35, 255, 255), dtype=np.uint8)
+        self._hsv_lower = np.array(DEFAULT_HSV_LOWER, dtype=np.uint8)
+        self._hsv_upper = np.array(DEFAULT_HSV_UPPER, dtype=np.uint8)
         self._bg_diff_threshold = bg_diff_threshold
-        self._enhance_low_light = enhance_low_light
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self._clean_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         self._motion_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
 
         self._bg_reference_blur: np.ndarray | None = None
@@ -433,6 +438,7 @@ class OpenCVHandDetector(HandDetector):
         self._motion_memory: np.ndarray | None = None
         self._last_hand_center: Point2D | None = None
         self._roi: tuple[float, float, float, float] | None = None
+        self._skin_calibrated: bool = False
 
         self._face_cascade: cv2.CascadeClassifier | None = None
         if enable_face_exclusion:
@@ -471,8 +477,8 @@ class OpenCVHandDetector(HandDetector):
         """Capture seated user + room background so raising your hand isolates ONLY the hand."""
         if frame_bgr is None or frame_bgr.size == 0 or frame_bgr.ndim != 3:
             return False
-        work = enhance_low_quality_frame(frame_bgr) if self._enhance_low_light else frame_bgr
-        self._bg_reference_blur = cv2.GaussianBlur(work, (9, 9), 0)
+        denoised = cv2.medianBlur(frame_bgr, 5)
+        self._bg_reference_blur = cv2.GaussianBlur(denoised, (9, 9), 0)
         self._last_hand_center = None
         logger.info("Calibrated OpenCV background/user reference (%dx%d).", frame_bgr.shape[1], frame_bgr.shape[0])
         return True
@@ -481,7 +487,7 @@ class OpenCVHandDetector(HandDetector):
         """Adapt YCrCb & HSV skin bounds to the user's hand under the current camera white balance."""
         if frame_bgr is None or frame_bgr.size == 0 or frame_bgr.ndim != 3:
             return False
-        work = enhance_low_quality_frame(frame_bgr) if self._enhance_low_light else frame_bgr
+        work = cv2.medianBlur(frame_bgr, 5)
         h, w = work.shape[:2]
         if self._roi is not None:
             rx, ry, rw, rh = self._roi
@@ -501,15 +507,16 @@ class OpenCVHandDetector(HandDetector):
         s_ch = hsv[:, :, 1]
 
         cr_med, cb_med = float(np.median(cr)), float(np.median(cb))
-        cr_std = max(12.0, float(np.std(cr)) * 2.2)
-        cb_std = max(12.0, float(np.std(cb)) * 2.2)
+        cr_std = max(10.0, min(22.0, float(np.std(cr)) * 2.0))
+        cb_std = max(10.0, min(22.0, float(np.std(cb)) * 2.0))
         self._ycrcb_lower = np.array([0, max(0, int(cr_med - cr_std)), max(0, int(cb_med - cb_std))], dtype=np.uint8)
         self._ycrcb_upper = np.array([255, min(255, int(cr_med + cr_std)), min(255, int(cb_med + cb_std))], dtype=np.uint8)
 
         h_med, s_med = float(np.median(h_ch)), float(np.median(s_ch))
-        h_span = max(16.0, float(np.std(h_ch)) * 2.5)
-        self._hsv_lower = np.array([max(0, int(h_med - h_span)), max(15, int(s_med - 65)), 30], dtype=np.uint8)
+        h_span = max(12.0, min(25.0, float(np.std(h_ch)) * 2.0))
+        self._hsv_lower = np.array([max(0, int(h_med - h_span)), max(25, int(s_med - 55)), 35], dtype=np.uint8)
         self._hsv_upper = np.array([min(179, int(h_med + h_span)), 255, 255], dtype=np.uint8)
+        self._skin_calibrated = True
         logger.info("Calibrated skin bounds from camera ROI: YCrCb=[%s..%s]", self._ycrcb_lower, self._ycrcb_upper)
         return True
 
@@ -518,9 +525,13 @@ class OpenCVHandDetector(HandDetector):
         self._motion_memory = None
         self._prev_gray = None
         self._last_hand_center = None
+        self._skin_calibrated = False
+        self._ycrcb_lower = np.array(DEFAULT_YCRCB_LOWER, dtype=np.uint8)
+        self._ycrcb_upper = np.array(DEFAULT_YCRCB_UPPER, dtype=np.uint8)
+        self._hsv_lower = np.array(DEFAULT_HSV_LOWER, dtype=np.uint8)
+        self._hsv_upper = np.array(DEFAULT_HSV_UPPER, dtype=np.uint8)
 
     def _update_motion_memory(self, gray: np.ndarray) -> np.ndarray | None:
-        """Maintain a decaying motion-energy mask highlighting actively moving hands."""
         if self._prev_gray is None or self._prev_gray.shape != gray.shape:
             self._prev_gray = gray
             self._motion_memory = np.zeros(gray.shape, dtype=np.float32)
@@ -543,7 +554,6 @@ class OpenCVHandDetector(HandDetector):
         h: int,
         motion_memory: np.ndarray | None,
     ) -> np.ndarray | None:
-        """Pick the most hand-like contour instead of blindly picking the largest face/torso blob."""
         frame_area = float(max(1, w * h))
         candidates: list[tuple[float, np.ndarray]] = []
         has_any_motion = bool(motion_memory is not None and float(np.max(motion_memory)) > 40.0)
@@ -560,37 +570,30 @@ class OpenCVHandDetector(HandDetector):
             w_norm = bw / w
             h_norm = bh / h
 
-            # Reject wide torso/shoulder blobs anchored to the bottom of the frame or ROI
             roi_bottom_px = int((self._roi[1] + self._roi[3]) * h) if self._roi is not None else h
             touches_bottom = (by + bh) >= int(roi_bottom_px - max(4, int(h * 0.04)))
             aspect = bh / max(1.0, float(bw))
             if touches_bottom and (w_norm > 0.42 or aspect < 0.70):
                 continue
 
-            # Measure recent motion energy inside this contour's bounding box
             motion_ratio = 0.0
             if motion_memory is not None:
                 patch = motion_memory[by:by + bh, bx:bx + bw]
                 if patch.size > 0:
                     motion_ratio = float(np.mean(patch > 40.0))
 
-            # Ideal hand occupies ~3%..18% of the frame
             size_score = 1.0 - min(1.0, abs(area_ratio - 0.08) / 0.24)
             score = size_score * 1.2
 
-            # Strongly reward blobs with recent motion when any movement is happening
             if has_any_motion:
                 score += motion_ratio * 3.2
                 if motion_ratio < 0.03:
-                    # Stationary skin blob (almost always the user's face or static wall)
                     score -= 1.5
 
-            # Penalize classic stationary upper-center face oval when multiple blobs compete
             if (0.28 <= cx_norm <= 0.72) and (cy_norm <= 0.44) and (0.75 <= (h_norm / max(0.01, w_norm)) <= 1.55):
                 if motion_ratio < 0.12 and len(contours) > 1:
                     score -= 1.2
 
-            # Reward tracking continuity near previously locked hand
             if self._last_hand_center is not None:
                 dist = math.hypot(cx_norm - self._last_hand_center.x, cy_norm - self._last_hand_center.y)
                 score += max(0.0, 0.9 - dist * 2.0)
@@ -609,7 +612,8 @@ class OpenCVHandDetector(HandDetector):
 
         h, w = bgr.shape[:2]
         frame_area = float(max(1, w * h))
-        work = enhance_low_quality_frame(bgr) if self._enhance_low_light else bgr
+        # Median blur removes PS3 Eye salt-and-pepper noise WITHOUT shifting wall colors into skin tones
+        work = cv2.medianBlur(bgr, 5)
 
         gray = cv2.GaussianBlur(cv2.cvtColor(work, cv2.COLOR_BGR2GRAY), (5, 5), 0)
         motion_memory = self._update_motion_memory(gray)
@@ -621,7 +625,12 @@ class OpenCVHandDetector(HandDetector):
         mask_hsv = cv2.inRange(hsv, self._hsv_lower, self._hsv_upper)
         mask = cv2.bitwise_and(mask_ycrcb, mask_hsv)
 
-        # Optional Active Hand Zone ROI mask (completely blocks user's face outside zone)
+        # Reject bright low-saturation beige/cream indoor walls (unless user calibrated custom skin color)
+        if not self._skin_calibrated:
+            b_ch, _g_ch, r_ch = cv2.split(work)
+            pale_wall = (r_ch > 160) & (b_ch > 135) & (hsv[:, :, 1] < 72)
+            mask[pale_wall] = 0
+
         if self._roi is not None:
             rx0 = max(0, int(self._roi[0] * w))
             ry0 = max(0, int(self._roi[1] * h))
@@ -631,16 +640,15 @@ class OpenCVHandDetector(HandDetector):
             roi_mask[ry0:ry1, rx0:rx1] = 255
             mask = cv2.bitwise_and(mask, roi_mask)
 
-        # If background/user reference is calibrated, isolate ONLY pixels that changed (the raised hand!)
         if self._bg_reference_blur is not None and self._bg_reference_blur.shape == work.shape:
             cur_blur = cv2.GaussianBlur(work, (9, 9), 0)
             diff = cv2.absdiff(cur_blur, self._bg_reference_blur)
             diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             _, fg_mask = cv2.threshold(diff_gray, self._bg_diff_threshold, 255, cv2.THRESH_BINARY)
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self._clean_kernel, iterations=1)
             fg_mask = cv2.dilate(fg_mask, self._kernel, iterations=2)
             mask = cv2.bitwise_and(mask, fg_mask)
 
-        # Suppress detected face regions if Haar XML is available
         if self._face_cascade is not None:
             faces = self._face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=4, minSize=(48, 48))
             for fx, fy, fw_box, fh_box in faces:
@@ -648,6 +656,8 @@ class OpenCVHandDetector(HandDetector):
                 pad_y = int(fh_box * 0.30)
                 mask[max(0, fy - pad_y):min(h, fy + fh_box + pad_y), max(0, fx - pad_x):min(w, fx + fw_box + pad_x)] = 0
 
+        # Suppress speckle noise cleanly while keeping finger gaps sharp
+        mask = cv2.medianBlur(mask, 5)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel, iterations=1)
 
@@ -678,7 +688,6 @@ class OpenCVHandDetector(HandDetector):
         hull_area = float(cv2.contourArea(hull_pts))
         solidity = area / max(1.0, hull_area)
 
-        # Convexity defects count deep valleys between spread fingers
         hull_indices = cv2.convexHull(chosen, returnPoints=False)
         finger_valleys = 0
         tip_points: list[tuple[float, float]] = []
@@ -777,6 +786,7 @@ def create_best_hand_detector(
     auto_download_model: bool = False,
 ) -> HandDetector:
     """Select MediaPipeHandDetector (21-pt neural, ignores face/body) if available, else OpenCVHandDetector."""
+    global _LAST_MEDIAPIPE_STATUS
     if prefer_mediapipe:
         candidate = Path(model_path) if model_path is not None else DEFAULT_MEDIAPIPE_MODEL_PATH
         if not candidate.exists() and auto_download_model:
@@ -785,9 +795,14 @@ def create_best_hand_detector(
                 candidate = resolved
         if candidate.exists():
             try:
-                return MediaPipeHandDetector(model_path=candidate)
+                det = MediaPipeHandDetector(model_path=candidate)
+                _LAST_MEDIAPIPE_STATUS = "Active (MediaPipe 21-pt AI)"
+                return det
             except Exception as exc:
+                _LAST_MEDIAPIPE_STATUS = f"MediaPipe init error: {exc}"
                 logger.warning("MediaPipeHandDetector unavailable (%s); falling back to OpenCVHandDetector.", exc)
+        elif not _LAST_MEDIAPIPE_STATUS:
+            _LAST_MEDIAPIPE_STATUS = f"Model missing: {candidate.name}"
     return OpenCVHandDetector()
 
 
@@ -823,16 +838,13 @@ class GestureRecognizer:
         self._last_timestamp = None
 
     def classify_hand(self, hand: HandDetectionResult) -> tuple[GestureType, float]:
-        """Classify a single frame's HandDetectionResult before temporal smoothing."""
         if not hand.detected:
             return GestureType.NONE, 0.0
 
-        # 1) Open palm (4-5 extended fingers) -> RECEIVE_PET
         if hand.extended_fingers >= self._receive_min_fingers and hand.openness_score >= self._receive_openness_threshold:
             conf = min(1.0, 0.5 * hand.confidence + 0.5 * hand.openness_score)
             return GestureType.RECEIVE_PET, conf
 
-        # 2) MediaPipe 21-landmark high-precision rules
         if hand.tracker_name == "mediapipe" and hand.landmarks_21:
             if hand.extended_fingers == 0 and hand.openness_score < 0.15:
                 return GestureType.FIST, min(1.0, 0.65 * hand.confidence + 0.35 * (1.0 - hand.openness_score))
@@ -844,7 +856,6 @@ class GestureRecognizer:
                 return GestureType.POINT, min(1.0, 0.70 * hand.confidence + 0.25)
             return GestureType.NONE, 0.0
 
-        # 3) OpenCV 2D contour rules (zero-download offline fallback)
         if hand.extended_fingers == 0 and hand.solidity >= 0.88 and hand.aspect_ratio < 1.25:
             conf = min(1.0, 0.55 * hand.confidence + 0.45 * hand.solidity)
             return GestureType.FIST, conf
@@ -862,7 +873,6 @@ class GestureRecognizer:
         return GestureType.NONE, 0.0
 
     def process_frame(self, frame: CameraFrame) -> GestureEvent:
-        """Detect hand, smooth palm coordinates, compute velocity, and apply multi-frame dwell filter."""
         hand = self.detector.detect(frame)
         raw_gesture, raw_conf = self.classify_hand(hand)
 
@@ -930,12 +940,7 @@ class GestureRecognizer:
 
 
 class HandoffGestureConfirmationController:
-    """Enforces the safety rule: camera gestures ONLY confirm an incoming handoff.
-
-    This controller NEVER initiates a handoff on its own. Without an active
-    incoming `pending_handoff_id` from the GCS Local Hub, all camera gestures
-    are safely ignored.
-    """
+    """Enforces the safety rule: camera gestures ONLY confirm an incoming handoff."""
 
     def __init__(
         self,
@@ -955,20 +960,17 @@ class HandoffGestureConfirmationController:
         return self._pending_handoff_id
 
     def arm_for_incoming_offer(self, handoff_id: str, expires_at: float) -> None:
-        """Arm gesture confirmation for a specific incoming handoff offer."""
         self._pending_handoff_id = handoff_id
         self._offer_expires_at = expires_at
         self.recognizer.reset()
         logger.info("Camera gesture confirmation armed for incoming handoff '%s'", handoff_id)
 
     def disarm(self) -> None:
-        """Clear any armed handoff offer (on completion, cancellation, or timeout)."""
         self._pending_handoff_id = None
         self._offer_expires_at = 0.0
         self.recognizer.reset()
 
     def process_event(self, event: GestureEvent) -> str | None:
-        """Evaluate an already-computed GestureEvent against an armed incoming handoff."""
         if self._pending_handoff_id is None:
             return None
 
@@ -991,7 +993,6 @@ class HandoffGestureConfirmationController:
         return None
 
     def process_frame(self, frame: CameraFrame) -> str | None:
-        """Inspect a camera frame; returns confirmed handoff_id ONLY if an offer is armed."""
         if self._pending_handoff_id is None:
             return None
 
@@ -1022,7 +1023,6 @@ def draw_hand_overlay(
 
     h, w = canvas.shape[:2]
 
-    # Draw Active Hand Zone box if enabled
     if roi_norm is not None:
         rx0, ry0 = int(roi_norm[0] * w), int(roi_norm[1] * h)
         rx1, ry1 = int((roi_norm[0] + roi_norm[2]) * w), int((roi_norm[1] + roi_norm[3]) * h)

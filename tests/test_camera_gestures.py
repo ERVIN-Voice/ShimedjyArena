@@ -35,6 +35,7 @@ from windows.hand_detection import (
     analyze_21_landmarks,
     draw_hand_overlay,
     enhance_low_quality_frame,
+    get_last_mediapipe_status,
 )
 from windows.pet_engine import DesktopBounds, PetEngine, ScreenRect
 
@@ -411,4 +412,23 @@ def test_opencv_detector_ignores_stationary_face_and_torso_and_tracks_moving_han
     tinted_hand = np.full((240, 320, 3), (30, 30, 30), dtype=np.uint8)
     cv2.circle(tinted_hand, (240, 130), 32, (95, 130, 175), -1)
     assert detector.calibrate_skin_from_roi(tinted_hand) is True
+
+
+def test_opencv_detector_rejects_noisy_beige_wall_without_whiteout() -> None:
+    """Regression test: warm beige indoor wall + PS3 Eye noise must NOT turn the skin mask white."""
+    rng = np.random.default_rng(42)
+    wall = np.full((240, 320, 3), (150, 172, 188), dtype=np.int16)
+    noise = rng.integers(-12, 13, size=wall.shape, dtype=np.int16)
+    noisy_wall = np.clip(wall + noise, 0, 255).astype(np.uint8)
+
+    detector = OpenCVHandDetector()
+    res = detector.detect(
+        CameraFrame(frame_bgr=noisy_wall, timestamp=1.0, frame_index=1, source_kind="ps3_eye")
+    )
+    assert res.detected is False
+    assert res.mask_preview is not None
+    white_ratio = float(np.count_nonzero(res.mask_preview)) / float(res.mask_preview.size)
+    assert white_ratio < 0.05
+    assert isinstance(get_last_mediapipe_status(), str)
+
 

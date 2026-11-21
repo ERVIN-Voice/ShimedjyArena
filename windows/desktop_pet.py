@@ -14,11 +14,11 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout
 
-from server.hub import build_pairing_uri, render_pairing_qr_ascii, save_pairing_qr_png
+from server.hub import build_pairing_uri, detect_local_ip, render_pairing_qr_ascii, save_pairing_qr_png
 from shared.config_loader import AvatarConfig, load_avatar_config, load_protocol_config
 from windows.animations import AnimationController
 from windows.camera import CameraBackend, CameraFrame, PS3EyeCamera, ThreadedCameraReader, create_camera
@@ -29,6 +29,7 @@ from windows.hand_detection import (
     HandoffGestureConfirmationController,
     create_best_hand_detector,
     draw_hand_overlay,
+    get_last_mediapipe_status,
 )
 from windows.network_client import EmbeddedHubRunner, HubClientEvent, WindowsHubClient
 from windows.pet_engine import EdgeHandoffEvent, PetEngine
@@ -43,16 +44,21 @@ logger = logging.getLogger(__name__)
 
 
 class PairingDialog(QDialog):
-    """Displays local Hub WebSocket URL and scannable QR code for Android pairing."""
+    """Displays local Android Web Companion URL, pairing URI, and scannable QR code."""
 
-    def __init__(self, pairing_uri: str, qr_png_path: Path) -> None:
+    def __init__(self, pairing_uri: str, web_url: str, qr_png_path: Path) -> None:
         super().__init__(None)
-        self.setWindowTitle("GCS Shimeji — Pair Android Device")
+        self.setWindowTitle("GCS Shimeji — Connect Android")
         layout = QVBoxLayout(self)
 
-        title = QLabel("Scan QR code or enter URL in Android GCS Shimeji:")
-        uri_lbl = QLabel(pairing_uri)
+        title = QLabel("Scan QR code on Android (opens Web Companion in App or Browser):")
+        web_lbl = QLabel(f"Android Web URL:  {web_url}")
+        web_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #0b6e4f;")
+        web_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        uri_lbl = QLabel(f"Pairing URI:  {pairing_uri}")
         uri_lbl.setWordWrap(True)
+        uri_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         qr_lbl = QLabel()
         pix = QPixmap(str(qr_png_path))
@@ -60,6 +66,7 @@ class PairingDialog(QDialog):
             qr_lbl.setPixmap(pix)
 
         layout.addWidget(title)
+        layout.addWidget(web_lbl)
         layout.addWidget(qr_lbl)
         layout.addWidget(uri_lbl)
         self.adjustSize()
@@ -177,6 +184,7 @@ class DesktopPetApp(QObject):
                     camera_kind=self._camera_kind,
                     camera_index=cam_idx,
                     tracker_name=self._hand_detector.name,
+                    tracker_note=get_last_mediapipe_status(),
                 )
                 self._camera_preview.request_calibrate_bg.connect(self._calibrate_camera_background)
                 self._camera_preview.request_calibrate_skin.connect(self._calibrate_camera_skin)
@@ -187,9 +195,10 @@ class DesktopPetApp(QObject):
                 if show_camera_preview:
                     self._camera_preview.show()
                 logger.info(
-                    "Live gesture control active (camera=%s, tracker=%s)",
+                    "Live gesture control active (camera=%s, tracker=%s, note=%s)",
                     self._camera_kind,
                     self._hand_detector.name,
+                    get_last_mediapipe_status(),
                 )
             else:
                 logger.warning(
@@ -208,9 +217,11 @@ class DesktopPetApp(QObject):
                 )
                 self._embedded_hub.start()
                 resolved_url = self._embedded_hub.hub.ws_url
+                web_url = self._embedded_hub.hub.web_url
                 uri = self._embedded_hub.hub.pairing_uri
-                logger.info("Android Pairing URI: %s", uri)
-                logger.info("\n%s", render_pairing_qr_ascii(uri))
+                logger.info("Android Web Client URL: %s", web_url)
+                logger.info("Android Pairing URI   : %s", uri)
+                logger.info("\n%s", render_pairing_qr_ascii(web_url))
 
             primary = bounds.primary_screen
             capabilities = ["desktop_pet", "mouse_drag", "click_confirm"]
@@ -420,10 +431,14 @@ class DesktopPetApp(QObject):
     def show_pairing_dialog(self) -> None:
         if self._embedded_hub is not None:
             uri = self._embedded_hub.hub.pairing_uri
+            web_url = self._embedded_hub.hub.web_url
         else:
-            uri = build_pairing_uri("0.0.0.0", self.hub_port, self.protocol)
-        qr_path = save_pairing_qr_png(uri, Path("pairing_qr.png"))
-        dialog = PairingDialog(uri, qr_path)
+            lan_ip = detect_local_ip()
+            web_port = self.hub_port + 1
+            web_url = f"http://{lan_ip}:{web_port}"
+            uri = build_pairing_uri("0.0.0.0", self.hub_port, self.protocol, web_port=web_port)
+        qr_path = save_pairing_qr_png(web_url, Path("pairing_qr.png"))
+        dialog = PairingDialog(uri, web_url, qr_path)
         dialog.exec()
 
     def _tick(self) -> None:
