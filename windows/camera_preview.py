@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Callable
-
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent, QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -30,13 +29,23 @@ def bgr_to_qpixmap(frame_bgr: np.ndarray, target_width: int = 480) -> QPixmap:
     return pix
 
 
+ROI_PRESETS: dict[str, tuple[float, float, float, float] | None] = {
+    "Full Frame": None,
+    "Right Hand Zone": (0.48, 0.14, 0.48, 0.78),
+    "Left Hand Zone": (0.04, 0.14, 0.48, 0.78),
+    "Center Zone": (0.22, 0.16, 0.56, 0.74),
+}
+
+
 class CameraPreviewWindow(QWidget):
     """Toggleable live camera HUD showing hand tracking, gestures, and calibration controls."""
 
     request_calibrate_bg = Signal()
+    request_calibrate_skin = Signal()
     request_clear_bg = Signal()
     request_toggle_pause = Signal(bool)
     request_switch_camera_index = Signal(int)
+    request_set_roi = Signal(object)  # tuple[float, float, float, float] | None
 
     def __init__(
         self,
@@ -75,8 +84,9 @@ class CameraPreviewWindow(QWidget):
                 font-weight: bold;
                 border: none;
             }
-            QSpinBox {
+            QSpinBox, QComboBox {
                 background-color: #1c2638;
+                color: #e6f4ff;
                 border: 1px solid #3c5478;
                 padding: 3px 6px;
                 border-radius: 4px;
@@ -99,27 +109,38 @@ class CameraPreviewWindow(QWidget):
         root.addWidget(self._status_label)
 
         controls_row1 = QHBoxLayout()
-        calib_btn = QPushButton("Calibrate BG")
+        calib_btn = QPushButton("Ignore Me + BG")
         calib_btn.setObjectName("primaryBtn")
-        calib_btn.setToolTip("Step hand out of frame and click to subtract room walls/desk")
+        calib_btn.setToolTip("Sit normally with hand lowered and click to ignore your face, body & room")
         calib_btn.clicked.connect(self.request_calibrate_bg.emit)
 
-        clear_btn = QPushButton("Reset BG")
+        skin_btn = QPushButton("Sample Palm Color")
+        skin_btn.setToolTip("Hold your palm in the center/hand zone and click to adapt to camera white balance")
+        skin_btn.clicked.connect(self.request_calibrate_skin.emit)
+
+        clear_btn = QPushButton("Reset")
         clear_btn.clicked.connect(self.request_clear_bg.emit)
 
-        self._pause_btn = QPushButton("Pause Gestures")
+        self._pause_btn = QPushButton("Pause")
         self._pause_btn.clicked.connect(self._on_pause_clicked)
 
         controls_row1.addWidget(calib_btn)
+        controls_row1.addWidget(skin_btn)
         controls_row1.addWidget(clear_btn)
         controls_row1.addWidget(self._pause_btn)
         root.addLayout(controls_row1)
 
         controls_row2 = QHBoxLayout()
-        mask_cb = QCheckBox("Show Hand Mask")
+        mask_cb = QCheckBox("Hand Mask")
         mask_cb.toggled.connect(self._on_mask_toggled)
 
-        cam_lbl = QLabel("Camera Index:")
+        zone_lbl = QLabel("Zone:")
+        self._zone_combo = QComboBox()
+        for label in ROI_PRESETS:
+            self._zone_combo.addItem(label)
+        self._zone_combo.currentTextChanged.connect(self._on_zone_changed)
+
+        cam_lbl = QLabel("Cam:")
         self._cam_spin = QSpinBox()
         self._cam_spin.setRange(0, 8)
         self._cam_spin.setValue(camera_index)
@@ -127,13 +148,18 @@ class CameraPreviewWindow(QWidget):
         switch_btn.clicked.connect(lambda: self.request_switch_camera_index.emit(int(self._cam_spin.value())))
 
         controls_row2.addWidget(mask_cb)
+        controls_row2.addWidget(zone_lbl)
+        controls_row2.addWidget(self._zone_combo)
         controls_row2.addStretch(1)
         controls_row2.addWidget(cam_lbl)
         controls_row2.addWidget(self._cam_spin)
         controls_row2.addWidget(switch_btn)
         root.addLayout(controls_row2)
 
-        hint = QLabel("Gestures: PINCH=Grab & Drag | POINT=Call Pet | OPEN PALM=Wake / Flick=Jump / Receive Handoff | FIST=Sleep")
+        hint = QLabel(
+            "Tip: MediaPipe AI (21-pt) ignores your face automatically. "
+            "In OpenCV mode, click 'Ignore Me + BG' with hand down or pick 'Right Hand Zone'."
+        )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #8fa6c2; font-size: 11px;")
         root.addWidget(hint)
@@ -156,12 +182,14 @@ class CameraPreviewWindow(QWidget):
     def _on_mask_toggled(self, checked: bool) -> None:
         self._show_mask = bool(checked)
 
+    def _on_zone_changed(self, label: str) -> None:
+        self.request_set_roi.emit(ROI_PRESETS.get(label))
+
     def _on_pause_clicked(self) -> None:
         self._paused = not self._paused
-        self._pause_btn.setText("Resume Gestures" if self._paused else "Pause Gestures")
+        self._pause_btn.setText("Resume" if self._paused else "Pause")
         self.request_toggle_pause.emit(self._paused)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        # Hide HUD window instead of closing the whole desktop pet app
         event.ignore()
         self.hide()

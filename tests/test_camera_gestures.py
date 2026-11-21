@@ -34,6 +34,7 @@ from windows.hand_detection import (
     Point2D,
     analyze_21_landmarks,
     draw_hand_overlay,
+    enhance_low_quality_frame,
 )
 from windows.pet_engine import DesktopBounds, PetEngine, ScreenRect
 
@@ -353,3 +354,61 @@ def test_gesture_controller_only_confirms_armed_handoff_never_initiates() -> Non
         assert controller.process_frame(cam.read()) is None  # type: ignore[arg-type]
         assert controller.pending_handoff_id is None
         assert len(confirmations) == 1
+
+
+def test_low_light_enhancement_lifts_dark_ps3_eye_frames() -> None:
+    dark = np.full((240, 320, 3), (18, 22, 28), dtype=np.uint8)
+    cv2.circle(dark, (160, 120), 40, (42, 55, 72), -1)
+    enhanced = enhance_low_quality_frame(dark)
+    assert enhanced.shape == dark.shape
+    assert float(np.mean(enhanced)) > float(np.mean(dark)) + 15.0
+
+
+def test_opencv_detector_ignores_stationary_face_and_torso_and_tracks_moving_hand() -> None:
+    """Reproduces the real-world case where a user sits in frame (face + torso) and waves a hand."""
+    detector = OpenCVHandDetector()
+    skin_bgr = (128, 168, 224)
+
+    def make_frame(hand_x: int | None, hand_y: int = 150, ts: float = 1.0) -> CameraFrame:
+        img = np.full((240, 320, 3), (35, 28, 24), dtype=np.uint8)
+        # Large stationary user face in upper-center + wide torso touching bottom
+        cv2.ellipse(img, (160, 75), (34, 42), 0, 0, 360, skin_bgr, -1)
+        cv2.rectangle(img, (70, 175), (250, 240), skin_bgr, -1)
+        if hand_x is not None:
+            cv2.circle(img, (hand_x, hand_y), 24, skin_bgr, -1)
+        return CameraFrame(frame_bgr=img, timestamp=ts, frame_index=int(ts * 30), source_kind="ps3_eye")
+
+    # 1) Motion-scored tracking without calibration: prime with stationary user, then move hand on the right
+    detector.detect(make_frame(None, ts=1.0))
+    detector.detect(make_frame(240, hand_y=140, ts=1.1))
+    res_motion = detector.detect(make_frame(260, hand_y=135, ts=1.2))
+    assert res_motion.detected is True
+    assert res_motion.palm_center is not None
+    # Must lock onto the moving hand on the right (x > 0.72), NOT the stationary face at x=0.50!
+    assert res_motion.palm_center.x > 0.72
+
+    # 2) Seated-user background calibration ("Ignore Me + BG"): completely erases user face & torso
+    detector.clear_background()
+    seated_only = make_frame(None, ts=2.0)
+    assert detector.calibrate_background(seated_only.frame_bgr) is True
+    assert detector.detect(seated_only).detected is False
+
+    raised_hand = make_frame(65, hand_y=130, ts=2.1)
+    res_bg = detector.detect(raised_hand)
+    assert res_bg.detected is True
+    assert res_bg.palm_center is not None
+    assert res_bg.palm_center.x < 0.30
+
+    # 3) Active Hand Zone (ROI) ignores face completely even without BG calibration
+    detector.clear_background()
+    detector.set_roi_norm((0.55, 0.15, 0.42, 0.75))
+    res_roi = detector.detect(make_frame(265, hand_y=145, ts=3.0))
+    assert res_roi.detected is True
+    assert res_roi.palm_center is not None
+    assert res_roi.palm_center.x > 0.72
+
+    # 4) Adaptive skin calibration handles unusual camera tint
+    tinted_hand = np.full((240, 320, 3), (30, 30, 30), dtype=np.uint8)
+    cv2.circle(tinted_hand, (240, 130), 32, (95, 130, 175), -1)
+    assert detector.calibrate_skin_from_roi(tinted_hand) is True
+

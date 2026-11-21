@@ -81,6 +81,7 @@ class DesktopPetApp(QObject):
         camera: CameraBackend | None = None,
         show_camera_preview: bool = True,
         hand_model_path: Path | None = None,
+        auto_download_hand_model: bool = True,
     ) -> None:
         super().__init__()
         self.qt_app = qt_app
@@ -151,7 +152,10 @@ class DesktopPetApp(QObject):
         self._last_preview_draw: float = 0.0
         self._camera_preview: CameraPreviewWindow | None = None
 
-        self._hand_detector = create_best_hand_detector(model_path=hand_model_path)
+        self._hand_detector = create_best_hand_detector(
+            model_path=hand_model_path,
+            auto_download_model=(auto_download_hand_model and camera is not None),
+        )
         self._gesture_recognizer = GestureRecognizer(detector=self._hand_detector, hold_frames=3)
         self._gesture_confirm = HandoffGestureConfirmationController(
             recognizer=self._gesture_recognizer,
@@ -175,9 +179,11 @@ class DesktopPetApp(QObject):
                     tracker_name=self._hand_detector.name,
                 )
                 self._camera_preview.request_calibrate_bg.connect(self._calibrate_camera_background)
+                self._camera_preview.request_calibrate_skin.connect(self._calibrate_camera_skin)
                 self._camera_preview.request_clear_bg.connect(self._clear_camera_background)
                 self._camera_preview.request_toggle_pause.connect(self._set_gestures_paused)
                 self._camera_preview.request_switch_camera_index.connect(self._switch_camera_index)
+                self._camera_preview.request_set_roi.connect(self._set_camera_roi)
                 if show_camera_preview:
                     self._camera_preview.show()
                 logger.info(
@@ -279,9 +285,26 @@ class DesktopPetApp(QObject):
             return
         if self._hand_detector.calibrate_background(self._last_camera_frame.frame_bgr):
             if self._camera_preview is not None:
-                self._camera_preview.set_status_text("Background calibrated! Move your hand into view.")
+                self._camera_preview.set_status_text("Seated user + room ignored! Raise your palm to control pet.")
         elif self._camera_preview is not None:
-            self._camera_preview.set_status_text(f"Tracker '{self._hand_detector.name}' does not need BG calibration.")
+            self._camera_preview.set_status_text(f"Tracker '{self._hand_detector.name}' ignores faces automatically.")
+
+    def _calibrate_camera_skin(self) -> None:
+        if self._last_camera_frame is None:
+            return
+        if self._hand_detector.calibrate_skin_from_roi(self._last_camera_frame.frame_bgr):
+            if self._camera_preview is not None:
+                self._camera_preview.set_status_text("Adapted hand skin color to current camera lighting!")
+        elif self._camera_preview is not None:
+            self._camera_preview.set_status_text(f"Tracker '{self._hand_detector.name}' does not require skin calibration.")
+
+    def _set_camera_roi(self, roi: object) -> None:
+        if roi is None or (isinstance(roi, tuple) and len(roi) == 4):
+            self._hand_detector.set_roi_norm(roi)  # type: ignore[arg-type]
+            if self._camera_preview is not None:
+                self._camera_preview.set_status_text(
+                    "Restricted tracking to Hand Zone box." if roi is not None else "Using full camera frame."
+                )
 
     def _clear_camera_background(self) -> None:
         self._hand_detector.clear_background()
@@ -435,6 +458,7 @@ class DesktopPetApp(QObject):
                         fps=self._camera_reader.fps,
                         show_mask=self._camera_preview.show_mask,
                         handoff_armed=(self._gesture_confirm.pending_handoff_id is not None),
+                        roi_norm=self._hand_detector.roi_norm,
                     )
                     self._camera_preview.update_frame(annotated, status_text=update.active_action)
 

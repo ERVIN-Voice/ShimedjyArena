@@ -80,6 +80,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional path to local MediaPipe hand_landmarker.task model for 21-point neural hand tracking",
     )
     parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Do not attempt one-time download of local hand_landmarker.task if missing",
+    )
+    parser.add_argument(
         "--list-cameras",
         action="store_true",
         help="Probe available camera indices and exit",
@@ -134,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
         camera=camera,
         show_camera_preview=not args.no_camera_preview,
         hand_model_path=args.hand_model,
+        auto_download_hand_model=not args.offline,
     )
 
     def _handle_sigint(*_args: object) -> None:

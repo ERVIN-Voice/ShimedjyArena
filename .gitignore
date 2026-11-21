@@ -15,6 +15,7 @@ build/
 # Runtime state & generated pairing artifacts
 .gcs_shimeji_state.json
 pairing_qr.png
+assets/models/*.task
 logs/
 *.log
 
