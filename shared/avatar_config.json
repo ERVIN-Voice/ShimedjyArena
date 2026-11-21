@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.0.0",
+  "avatar": {
+    "id": "placeholder_slime_cube",
+    "name": "GCS Pixel Companion (Placeholder)",
+    "description": "Temporary pixel-art placeholder sprite sheet. Replace sprite_sheet and animations to change appearance without modifying application code.",
+    "sprite_sheet": "assets/avatar/placeholder_spritesheet.png",
+    "frame_width": 32,
+    "frame_height": 32,
+    "default_scale": 4,
+    "min_scale": 2,
+    "max_scale": 8,
+    "scaling_mode": "nearest",
+    "alpha_hit_threshold": 16
+  },
+  "animations": {
+    "idle": {
+      "row": 0,
+      "frames": 4,
+      "fps": 4.0,
+      "loop": true,
+      "next": null
+    },
+    "walk": {
+      "row": 1,
+      "frames": 6,
+      "fps": 8.0,
+      "loop": true,
+      "next": null
+    },
+    "run": {
+      "row": 2,
+      "frames": 6,
+      "fps": 12.0,
+      "loop": true,
+      "next": null
+    },
+    "jump": {
+      "row": 3,
+      "frames": 4,
+      "fps": 10.0,
+      "loop": false,
+      "next": "landing"
+    },
+    "sleep": {
+      "row": 4,
+      "frames": 4,
+      "fps": 2.0,
+      "loop": true,
+      "next": null
+    },
+    "grab": {
+      "row": 5,
+      "frames": 4,
+      "fps": 8.0,
+      "loop": true,
+      "next": null
+    },
+    "handoff": {
+      "row": 6,
+      "frames": 6,
+      "fps": 12.0,
+      "loop": false,
+      "next": null
+    },
+    "receive": {
+      "row": 7,
+      "frames": 6,
+      "fps": 12.0,
+      "loop": false,
+      "next": "landing"
+    },
+    "landing": {
+      "row": 8,
+      "frames": 4,
+      "fps": 10.0,
+      "loop": false,
+      "next": "idle"
+    }
+  },
+  "behavior": {
+    "tick_hz": 60,
+    "walk_speed_px_per_sec": 95.0,
+    "run_speed_px_per_sec": 210.0,
+    "gravity_px_per_sec2": 1400.0,
+    "jump_velocity_px_per_sec": -520.0,
+    "smooth_follow_factor": 0.28,
+    "idle_to_sleep_seconds": 30.0,
+    "wander_min_seconds": 2.5,
+    "wander_max_seconds": 6.5,
+    "edge_handoff_margin_px": 14,
+    "edge_handoff_hold_seconds": 0.35,
+    "position_state_file": ".gcs_shimeji_state.json"
+  }
+}

@@ -1,0 +1,13 @@
+# GCS Shimeji — Python Dependencies (Python 3.11+)
+PySide6>=6.7.0
+websockets>=12.0
+Pillow>=10.3.0
+opencv-python-headless>=4.9.0; platform_system == "Linux"
+opencv-python>=4.9.0; platform_system != "Linux"
+numpy>=1.26.0
+zeroconf>=0.132.0
+qrcode>=7.4.2
+
+# Testing
+pytest>=8.2.0
+pytest-asyncio>=0.23.7
