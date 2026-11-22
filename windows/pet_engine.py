@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from shared.config_loader import AvatarConfig
+from shared.config_loader import AvatarConfig, get_user_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +172,11 @@ class PetEngine:
         self.bounds = desktop_bounds
         self.pet_width = pet_width
         self.pet_height = pet_height
-        self.state_file = state_file or Path(config.behavior.position_state_file)
+        if state_file is not None:
+            self.state_file = state_file
+        else:
+            raw_state = Path(config.behavior.position_state_file)
+            self.state_file = raw_state if raw_state.is_absolute() else (get_user_data_dir() / raw_state)
         self._rng = rng or random.Random()
         self._on_edge_handoff = on_edge_handoff
 

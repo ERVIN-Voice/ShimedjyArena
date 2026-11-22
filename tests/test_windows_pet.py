@@ -177,3 +177,36 @@ def test_pet_position_persistence_and_monitor_clamping(tmp_path: Path) -> None:
     assert engine2.facing == "left"
     assert 0.0 <= engine2.x <= 1920 - 128
     assert 0.0 <= engine2.y <= 1080 - 128
+
+
+def test_frozen_packaging_paths_and_icon_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    from shared import config_loader
+    from build_exe.generate_icon import generate_icon
+    from windows.main import parse_args
+
+    # Icon generation produces a valid multi-size ICO
+    ico_path = generate_icon(tmp_path / "shimeji.ico")
+    assert ico_path.exists()
+    assert ico_path.stat().st_size > 1024
+
+    # Simulated PyInstaller frozen environment resolves PROJECT_ROOT to sys._MEIPASS
+    fake_bundle = tmp_path / "meipass"
+    fake_bundle.mkdir()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(fake_bundle), raising=False)
+    assert config_loader._detect_project_root() == fake_bundle.resolve()
+
+    # Writable user data dir uses APPDATA on Windows when frozen
+    fake_appdata = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(fake_appdata))
+    monkeypatch.setattr(sys, "platform", "win32")
+    data_dir = config_loader.get_user_data_dir()
+    assert data_dir == fake_appdata / "GCS-Shimeji"
+    assert data_dir.exists()
+
+    # CLI parser accepts --self-test and --self-test-log
+    parsed = parse_args(["--self-test", "--self-test-log", str(tmp_path / "st.log")])
+    assert parsed.self_test is True
+    assert parsed.self_test_log == tmp_path / "st.log"
+

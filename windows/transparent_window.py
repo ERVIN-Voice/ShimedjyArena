@@ -101,6 +101,7 @@ class TransparentPetWindow(QWidget):
     request_pet_love = Signal()
     request_show_pairing = Signal()
     request_toggle_camera_hud = Signal()
+    request_enable_camera = Signal(str)  # "webcam" | "ps3_eye"
     request_quit = Signal()
 
     def __init__(self, width: int, height: int) -> None:
@@ -334,6 +335,14 @@ class TransparentPetWindow(QWidget):
             cam_action = QAction("Camera & Gestures HUD", menu)
             cam_action.triggered.connect(self.request_toggle_camera_hud.emit)
             menu.addAction(cam_action)
+        else:
+            cam_webcam = QAction("Enable Camera Gestures (Webcam)", menu)
+            cam_webcam.triggered.connect(lambda: self.request_enable_camera.emit("webcam"))
+            menu.addAction(cam_webcam)
+
+            cam_ps3 = QAction("Enable Camera Gestures (PS3 Eye)", menu)
+            cam_ps3.triggered.connect(lambda: self.request_enable_camera.emit("ps3_eye"))
+            menu.addAction(cam_ps3)
 
         quit_action = QAction("Quit GCS Shimeji", menu)
         quit_action.triggered.connect(self.request_quit.emit)
