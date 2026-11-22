@@ -12,10 +12,52 @@ from dataclasses import dataclass
 from typing import Callable
 
 from PIL import Image
+import numpy as np
 
 from shared.config_loader import AnimationSpec, AvatarConfig
 
 logger = logging.getLogger(__name__)
+
+# Original body palette of placeholder_spritesheet.png (kept untouched for eyes/outline/blush):
+_BASE_BODY_RGB = (86, 198, 224)       # #56C6E0 main body
+_BASE_HIGHLIGHT_RGB = (146, 232, 248) # #92E8F8 top highlight
+_BASE_SHADE_RGB = (48, 138, 174)      # #308AAE bottom shade
+
+# Unified 8-emotion pixel-art body palettes: (body, highlight, shade)
+EMOTION_PALETTES: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]] = {
+    "neutral": (_BASE_BODY_RGB, _BASE_HIGHLIGHT_RGB, _BASE_SHADE_RGB),
+    "happy": ((255, 213, 79), (255, 241, 168), (212, 155, 26)),      # Sunny golden yellow
+    "love": ((255, 110, 168), (255, 180, 210), (201, 59, 118)),      # Vibrant strawberry pink
+    "excited": ((76, 232, 138), (166, 249, 197), (31, 164, 90)),     # Energetic emerald mint
+    "scared": ((122, 148, 232), (185, 202, 252), (71, 94, 179)),     # Pale icy indigo
+    "dizzy": ((180, 124, 255), (221, 194, 255), (123, 70, 199)),     # Swirly amethyst purple
+    "angry": ((255, 77, 77), (255, 154, 154), (189, 34, 34)),        # Fiery crimson red
+    "sleepy": ((136, 140, 224), (191, 194, 245), (85, 89, 168)),     # Calm night lavender
+}
+
+
+def recolor_sprite_for_emotion(image: Image.Image, emotion: str) -> Image.Image:
+    """Apply an exact pixel-art palette swap to the pet's body colors for the given emotion.
+
+    Preserves dark outlines, eyes, white specular highlights, and cheek accents untouched.
+    """
+    norm = str(emotion or "neutral").strip().lower()
+    if norm == "neutral" or norm not in EMOTION_PALETTES:
+        return image
+
+    body_rgb, hi_rgb, sh_rgb = EMOTION_PALETTES[norm]
+    arr = np.array(image.convert("RGBA"), copy=True)
+    rgb = arr[:, :, :3]
+    alpha_mask = arr[:, :, 3] > 0
+
+    m_body = alpha_mask & (rgb[:, :, 0] == _BASE_BODY_RGB[0]) & (rgb[:, :, 1] == _BASE_BODY_RGB[1]) & (rgb[:, :, 2] == _BASE_BODY_RGB[2])
+    m_hi = alpha_mask & (rgb[:, :, 0] == _BASE_HIGHLIGHT_RGB[0]) & (rgb[:, :, 1] == _BASE_HIGHLIGHT_RGB[1]) & (rgb[:, :, 2] == _BASE_HIGHLIGHT_RGB[2])
+    m_sh = alpha_mask & (rgb[:, :, 0] == _BASE_SHADE_RGB[0]) & (rgb[:, :, 1] == _BASE_SHADE_RGB[1]) & (rgb[:, :, 2] == _BASE_SHADE_RGB[2])
+
+    arr[m_body, 0], arr[m_body, 1], arr[m_body, 2] = body_rgb
+    arr[m_hi, 0], arr[m_hi, 1], arr[m_hi, 2] = hi_rgb
+    arr[m_sh, 0], arr[m_sh, 1], arr[m_sh, 2] = sh_rgb
+    return Image.fromarray(arr, mode="RGBA")
 
 
 @dataclass(frozen=True)
@@ -90,7 +132,7 @@ class SpriteSheet:
         self._scale = self._clamp_scale(scale if scale is not None else config.visual.default_scale)
         self._sheet: Image.Image = self._load_sheet()
         self._raw_frames: dict[str, list[Image.Image]] = {}
-        self._scaled_cache: dict[tuple[str, int, str, int], RenderedFrame] = {}
+        self._scaled_cache: dict[tuple[str, int, str, int, str], RenderedFrame] = {}
         self._slice_all_animations()
 
     def _clamp_scale(self, scale: int) -> int:
@@ -146,20 +188,29 @@ class SpriteSheet:
     def scaled_height(self) -> int:
         return self.config.visual.frame_height * self._scale
 
-    def get_frame(self, animation: str, frame_index: int, facing: str = "right") -> RenderedFrame:
-        """Return a nearest-neighbor scaled RenderedFrame for the requested animation & facing."""
+    def get_frame(
+        self,
+        animation: str,
+        frame_index: int,
+        facing: str = "right",
+        emotion: str = "neutral",
+    ) -> RenderedFrame:
+        """Return a nearest-neighbor scaled RenderedFrame for the requested animation, facing & emotion."""
         if animation not in self._raw_frames:
             raise KeyError(f"Unknown animation '{animation}'. Available: {sorted(self._raw_frames)}")
         frames = self._raw_frames[animation]
         idx = frame_index % len(frames)
         norm_facing = "left" if facing == "left" else "right"
-        cache_key = (animation, idx, norm_facing, self._scale)
+        norm_emotion = emotion.lower() if isinstance(emotion, str) and emotion.lower() in EMOTION_PALETTES else "neutral"
+        cache_key = (animation, idx, norm_facing, self._scale, norm_emotion)
 
         cached = self._scaled_cache.get(cache_key)
         if cached is not None:
             return cached
 
         raw = frames[idx]
+        if norm_emotion != "neutral":
+            raw = recolor_sprite_for_emotion(raw, norm_emotion)
         if norm_facing == "left":
             raw = raw.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
 
@@ -195,6 +246,7 @@ class AnimationController:
         self._frame_index: int = 0
         self._elapsed: float = 0.0
         self._facing: str = "right"
+        self._emotion: str = "neutral"
         self._finished: bool = False
 
     @property
@@ -213,6 +265,15 @@ class AnimationController:
     def facing(self, value: str) -> None:
         if value in ("left", "right"):
             self._facing = value
+
+    @property
+    def emotion(self) -> str:
+        return self._emotion
+
+    @emotion.setter
+    def emotion(self, value: str) -> None:
+        norm = str(value or "neutral").strip().lower()
+        self._emotion = norm if norm in EMOTION_PALETTES else "neutral"
 
     @property
     def finished(self) -> bool:
@@ -282,4 +343,9 @@ class AnimationController:
 
     def current_frame(self) -> RenderedFrame:
         """Return the current nearest-neighbor scaled RenderedFrame."""
-        return self.sprite_sheet.get_frame(self._current_name, self._frame_index, self._facing)
+        return self.sprite_sheet.get_frame(
+            self._current_name,
+            self._frame_index,
+            self._facing,
+            self._emotion,
+        )

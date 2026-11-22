@@ -54,6 +54,56 @@
     landing: { row: 8, frames: 3, fps: 10, loop: false },
   };
 
+  const BASE_PALETTE = [
+    [86, 198, 224],   // body
+    [146, 232, 248],  // highlight
+    [48, 138, 174],   // shade
+  ];
+
+  const EMOTION_PALETTES = {
+    neutral: BASE_PALETTE,
+    happy: [[255, 213, 79], [255, 241, 168], [212, 155, 26]],
+    love: [[255, 110, 168], [255, 180, 210], [201, 59, 118]],
+    excited: [[76, 232, 138], [166, 249, 197], [31, 164, 90]],
+    scared: [[122, 148, 232], [185, 202, 252], [71, 94, 179]],
+    dizzy: [[180, 124, 255], [221, 194, 255], [123, 70, 199]],
+    angry: [[255, 77, 77], [255, 154, 154], [189, 34, 34]],
+    sleepy: [[136, 140, 224], [191, 194, 245], [85, 89, 168]],
+  };
+
+  const recoloredSheets = {};
+
+  function getSpriteSheetForEmotion(emotion) {
+    if (!state.spriteSheet || !state.spriteLoaded) return null;
+    const key = EMOTION_PALETTES[emotion] ? emotion : "neutral";
+    if (key === "neutral") return state.spriteSheet;
+    if (recoloredSheets[key]) return recoloredSheets[key];
+
+    const off = document.createElement("canvas");
+    off.width = state.spriteSheet.naturalWidth || state.spriteSheet.width;
+    off.height = state.spriteSheet.naturalHeight || state.spriteSheet.height;
+    const octx = off.getContext("2d");
+    octx.drawImage(state.spriteSheet, 0, 0);
+    const imgData = octx.getImageData(0, 0, off.width, off.height);
+    const d = imgData.data;
+    const pal = EMOTION_PALETTES[key];
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] === 0) continue;
+      const r = d[i], g = d[i + 1], b = d[i + 2];
+      for (let p = 0; p < 3; p++) {
+        if (r === BASE_PALETTE[p][0] && g === BASE_PALETTE[p][1] && b === BASE_PALETTE[p][2]) {
+          d[i] = pal[p][0];
+          d[i + 1] = pal[p][1];
+          d[i + 2] = pal[p][2];
+          break;
+        }
+      }
+    }
+    octx.putImageData(imgData, 0, 0);
+    recoloredSheets[key] = off;
+    return off;
+  }
+
   function getOrCreateDeviceId() {
     if (window.GcsAndroidBridge && typeof window.GcsAndroidBridge.getDeviceId === "function") {
       try {
@@ -134,6 +184,7 @@
     facing: 1,
     grounded: true,
     animation: "idle",
+    emotion: "neutral",
     animFrame: 0,
     animAcc: 0,
     aiTimer: 2.0,
@@ -281,6 +332,9 @@
     const prevOwner = state.ownerDeviceId;
     state.ownerDeviceId = st.owner || null;
     state.handoffState = st.handoff_state || "IDLE";
+    if (st.emotion && EMOTION_PALETTES[st.emotion]) {
+      state.emotion = st.emotion;
+    }
 
     if (state.ownerDeviceId === state.deviceId && prevOwner !== state.deviceId) {
       const petW = getPetW();
@@ -339,17 +393,20 @@
 
       case "handoff_offer":
         if (payload.handoff_id) {
-          const timeoutMs = (payload.timeout_seconds || 6.0) * 1000;
-          state.incomingOffer = {
+          if (payload.avatar_state && payload.avatar_state.emotion && EMOTION_PALETTES[payload.avatar_state.emotion]) {
+            state.emotion = payload.avatar_state.emotion;
+          }
+          // Auto-accept immediately on phone without requiring a manual tap
+          state.incomingOffer = null;
+          triggerHaptic("confirm");
+          sendEnvelope("handoff_confirm", {
             handoff_id: payload.handoff_id,
-            source_device_id: payload.source_device_id || "windows",
-            source_device_name: payload.source_device_name || payload.source_device_id || "Windows PC",
-            edge: payload.edge || "left",
-            timeout_ms: timeoutMs,
-            expires_at_ms: Date.now() + timeoutMs,
-          };
-          triggerHaptic("offer");
-          bannerEl.textContent = `Incoming pet from ${state.incomingOffer.source_device_name}! Tap to receive.`;
+            device_id: state.deviceId,
+            accepted: true,
+            confirmation_source: "auto",
+            landing_position: { x: Math.round((state.stageW - getPetW()) / 2), y: Math.round(getFloorY()) },
+          });
+          bannerEl.textContent = "Receiving pet automatically...";
           updateOverlays();
         }
         break;
@@ -719,6 +776,7 @@
     ctx.fill();
 
     if (state.spriteLoaded && state.spriteSheet) {
+      const sheetImg = getSpriteSheetForEmotion(state.emotion) || state.spriteSheet;
       const anim = state.animations[state.animation] || DEFAULT_ANIMS.idle;
       const sx = (state.animFrame % Math.max(1, anim.frames)) * state.frameW;
       const sy = anim.row * state.frameH;
@@ -728,9 +786,9 @@
       if (state.facing < 0) {
         ctx.translate(drawX + petW, drawY);
         ctx.scale(-1, 1);
-        ctx.drawImage(state.spriteSheet, sx, sy, state.frameW, state.frameH, 0, 0, petW, petH);
+        ctx.drawImage(sheetImg, sx, sy, state.frameW, state.frameH, 0, 0, petW, petH);
       } else {
-        ctx.drawImage(state.spriteSheet, sx, sy, state.frameW, state.frameH, drawX, drawY, petW, petH);
+        ctx.drawImage(sheetImg, sx, sy, state.frameW, state.frameH, drawX, drawY, petW, petH);
       }
       ctx.restore();
     } else {

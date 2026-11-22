@@ -1406,10 +1406,11 @@ def draw_hand_overlay(
     show_mask: bool = False,
     handoff_armed: bool = False,
     roi_norm: tuple[float, float, float, float] | None = None,
+    control_zone_norm: tuple[float, float, float, float] | None = None,
     pet_emotion: str = "",
 ) -> np.ndarray:
     """Render real-time hand skeleton/contour, finger-state pills, pinch meter, palm crosshair,
-    and gesture HUD onto a BGR frame.
+    full-screen control zone guide, and gesture HUD onto a BGR frame.
     """
     hand = event.hand
     if show_mask and hand.mask_preview is not None:
@@ -1418,6 +1419,21 @@ def draw_hand_overlay(
         canvas = frame_bgr.copy()
 
     h, w = canvas.shape[:2]
+
+    if control_zone_norm is not None:
+        zx0, zy0 = int(control_zone_norm[0] * w), int(control_zone_norm[1] * h)
+        zx1, zy1 = int((control_zone_norm[0] + control_zone_norm[2]) * w), int((control_zone_norm[1] + control_zone_norm[3]) * h)
+        cv2.rectangle(canvas, (zx0, zy0), (zx1, zy1), (110, 210, 235), 1)
+        cv2.putText(
+            canvas,
+            "FULL SCREEN ZONE (reach edge = send)",
+            (zx0 + 4, max(62, zy0 + 14)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (110, 210, 235),
+            1,
+            cv2.LINE_AA,
+        )
 
     if roi_norm is not None:
         rx0, ry0 = int(roi_norm[0] * w), int(roi_norm[1] * h)

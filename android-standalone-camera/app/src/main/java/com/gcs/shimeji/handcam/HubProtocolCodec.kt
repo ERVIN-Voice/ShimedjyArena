@@ -229,7 +229,7 @@ object HubProtocolCodec {
         landingX: Float? = null,
         landingY: Float? = null,
     ): String {
-        val safeSource = if (confirmationSource in setOf("touch", "click", "keyboard", "gesture")) {
+        val safeSource = if (confirmationSource in setOf("touch", "click", "keyboard", "gesture", "auto")) {
             confirmationSource
         } else {
             "touch"

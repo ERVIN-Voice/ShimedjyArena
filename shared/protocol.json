@@ -20,7 +20,8 @@
       "touch",
       "click",
       "keyboard",
-      "gesture"
+      "gesture",
+      "auto"
     ],
     "allowed_edges": [
       "left",

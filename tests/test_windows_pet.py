@@ -210,3 +210,53 @@ def test_frozen_packaging_paths_and_icon_generation(tmp_path: Path, monkeypatch:
     assert parsed.self_test is True
     assert parsed.self_test_log == tmp_path / "st.log"
 
+
+def test_emotion_palette_swap_recolors_body_and_preserves_eyes_and_outline() -> None:
+    from windows.animations import EMOTION_PALETTES
+
+    cfg = load_avatar_config()
+    ctrl = AnimationController(cfg, scale=3)
+
+    neutral_colors = _pixel_set(ctrl.current_frame().image)
+    assert (86, 198, 224, 255) in neutral_colors
+    assert (24, 28, 42, 255) in neutral_colors  # dark outline / eyes
+
+    for emotion, (body_rgb, hi_rgb, sh_rgb) in EMOTION_PALETTES.items():
+        if emotion == "neutral":
+            continue
+        ctrl.emotion = emotion
+        colors = _pixel_set(ctrl.current_frame().image)
+        assert (*body_rgb, 255) in colors, f"Missing recolored body for emotion '{emotion}'"
+        assert (*hi_rgb, 255) in colors, f"Missing recolored highlight for emotion '{emotion}'"
+        assert (*sh_rgb, 255) in colors, f"Missing recolored shade for emotion '{emotion}'"
+        assert (86, 198, 224, 255) not in colors, f"Original cyan leaked into '{emotion}'"
+        # Eyes and dark outline remain untouched
+        assert (24, 28, 42, 255) in colors
+
+
+def test_fling_to_edge_triggers_handoff(tmp_path: Path) -> None:
+    cfg = load_avatar_config()
+    bounds = DesktopBounds([ScreenRect(0, 0, 1920, 1080, is_primary=True)])
+    events: list[EdgeHandoffEvent] = []
+    engine = PetEngine(
+        cfg,
+        bounds,
+        pet_width=128,
+        pet_height=128,
+        state_file=tmp_path / "fling.json",
+        rng=random.Random(1),
+        on_edge_handoff=events.append,
+    )
+
+    # Simulate fast fling toward the right edge (starting near 75% across screen)
+    engine.set_position_immediate(1380.0, 400.0)
+    engine.start_drag(1420.0, 400.0)
+    for step in range(1, 9):
+        engine.update_drag(1420.0 + step * 50.0, 400.0)
+        engine.tick(1.0 / 60.0)
+    engine.end_drag()
+
+    assert len(events) == 1
+    assert events[0].edge == "right"
+
+

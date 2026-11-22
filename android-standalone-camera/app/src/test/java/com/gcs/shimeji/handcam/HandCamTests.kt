@@ -227,6 +227,18 @@ class HandCamTests {
         assertEquals("Gaming-PC", parsed.sourceDeviceName)
         assertEquals("love", parsed.emotion)
         assertEquals(PetEmotion.LOVE, HubProtocolCodec.petEmotionFromProtocol(parsed.emotion))
+
+        // Auto-accept confirmation source is preserved for zero-tap phone receive
+        val autoConfirmJson = HubProtocolCodec.buildHandoffConfirm(
+            handoffId = "ho-999",
+            deviceId = "android-1",
+            accepted = true,
+            confirmationSource = "auto",
+            landingX = 120f,
+            landingY = 600f,
+        )
+        assertTrue(autoConfirmJson.contains("\"confirmation_source\":\"auto\""))
+        assertTrue(autoConfirmJson.contains("\"accepted\":true"))
     }
 
     @Test
@@ -254,5 +266,38 @@ class HandCamTests {
         physics.receiveFromHub(edge = "right", normalizedY = 0.5f, incomingEmotion = PetEmotion.ANGRY)
         assertEquals(PetEmotion.ANGRY, physics.emotion)
         assertTrue(physics.x < 100f)
+    }
+
+    @Test
+    fun phoneCameraActiveZoneReachesFullScreenEdgesAndFlingTriggersHandoff() {
+        val triggered = mutableListOf<Pair<String, Float>>()
+        val physics = EmotionalPetPhysics(
+            screenWidth = 1080f,
+            screenHeight = 1920f,
+            petSizePx = 120f,
+            random = Random(11),
+            onEdgeHandoff = { edge, ny -> triggered.add(edge to ny) },
+        )
+        physics.edgeHandoffEnabled = true
+
+        // Comfortable inner camera zone [0.22..0.78] X, [0.18..0.82] Y covers 100% of phone screen
+        val (lx, ly) = physics.mapHandToScreen(0.22f, 0.18f)
+        assertEquals(0f, lx, 0.5f)
+        assertEquals(0f, ly, 0.5f)
+
+        val (rx, ry) = physics.mapHandToScreen(0.78f, 0.82f)
+        assertEquals(960f, rx, 0.5f)
+        assertEquals(1800f, ry, 0.5f)
+
+        // Fast fling toward the right edge sends pet to PC
+        physics.x = 760f
+        physics.y = 800f
+        physics.startDrag(760f, 800f)
+        repeat(4) {
+            physics.updateDrag(28f, 0f, 0.02f)
+        }
+        physics.endDrag()
+        assertEquals(1, triggered.size)
+        assertEquals("right", triggered[0].first)
     }
 }
