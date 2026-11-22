@@ -89,6 +89,7 @@ class EmotionalPetPhysics(
     // Hand gesture runtime state
     var isHandGrabbing: Boolean = false
         private set
+    private var pinchMissFrames: Int = 0
     private var handPointTargetX: Float? = null
     private var fistHoldSec: Float = 0f
     private var palmActionCooldown: Float = 0f
@@ -236,6 +237,21 @@ class EmotionalPetPhysics(
     }
 
     /**
+     * Map normalized camera palm coordinates onto 100% of the phone screen using a generous
+     * comfortable active zone ([0.22..0.78] X, [0.18..0.82] Y) so the user can easily reach
+     * every screen edge and fling/send the pet to PC without the hand leaving the camera frame.
+     */
+    fun mapHandToScreen(palmX: Float, palmY: Float): Pair<Float, Float> {
+        val padX = 0.22f
+        val padY = 0.18f
+        val nx = ((palmX - padX) / (1f - 2f * padX)).coerceIn(0f, 1f)
+        val ny = ((palmY - padY) / (1f - 2f * padY)).coerceIn(0f, 1f)
+        val maxX = (screenWidth - petSizePx).coerceAtLeast(0f)
+        val maxY = (screenHeight - petSizePx).coerceAtLeast(0f)
+        return (nx * maxX) to (ny * maxY)
+    }
+
+    /**
      * Apply real-time camera hand gesture to the overlay pet.
      * Should be called every frame or every camera analysis update.
      */
@@ -244,38 +260,41 @@ class EmotionalPetPhysics(
             fistHoldSec = 0f
             handPointTargetX = null
             if (isHandGrabbing) {
-                isHandGrabbing = false
-                endDrag()
+                pinchMissFrames += 1
+                if (pinchMissFrames >= 5) {
+                    isHandGrabbing = false
+                    pinchMissFrames = 0
+                    endDrag()
+                }
             }
             return
         }
 
-        // Release pinch grab as soon as gesture switches away from PINCH
+        // Release pinch grab immediately on a deliberate different gesture
         if (isHandGrabbing && frame.gesture != HandGesture.PINCH) {
             isHandGrabbing = false
+            pinchMissFrames = 0
             endDrag()
         }
 
         when (frame.gesture) {
             HandGesture.PINCH -> {
                 fistHoldSec = 0f
+                pinchMissFrames = 0
                 handPointTargetX = null
-                val maxX = (screenWidth - petSizePx).coerceAtLeast(0f)
-                val maxY = (screenHeight - petSizePx).coerceAtLeast(0f)
-                val targetX = (frame.palmX * maxX).coerceIn(0f, maxX)
-                val targetY = (frame.palmY * maxY).coerceIn(0f, maxY)
+                val (targetX, targetY) = mapHandToScreen(frame.palmX, frame.palmY)
                 if (!isHandGrabbing) {
                     isHandGrabbing = true
                     startDrag(targetX, targetY)
                     setEmotion(PetEmotion.SCARED, 2.0f, "Ой! 🤏")
                 }
-                val follow = (dt * 12f).coerceIn(0.12f, 0.55f)
+                val follow = (dt * 18f).coerceIn(0.18f, 0.72f)
                 val dx = (targetX - x) * follow
                 val dy = (targetY - y) * follow
                 updateDrag(dx, dy, dt.coerceAtLeast(0.016f))
                 // Cap pinch velocity so initial snap-to-hand doesn't launch at extreme speed
-                vx = vx.coerceIn(-950f, 950f)
-                vy = vy.coerceIn(-950f, 950f)
+                vx = vx.coerceIn(-1100f, 1100f)
+                vy = vy.coerceIn(-1100f, 1100f)
             }
 
             HandGesture.OPEN_PALM -> {
@@ -305,8 +324,7 @@ class EmotionalPetPhysics(
             HandGesture.POINT -> {
                 fistHoldSec = 0f
                 if (mood != PetMood.TUMBLING && mood != PetMood.SPLAT && mood != PetMood.DRAGGED) {
-                    val targetX = (frame.palmX * (screenWidth - petSizePx))
-                        .coerceIn(0f, (screenWidth - petSizePx).coerceAtLeast(0f))
+                    val (targetX, _) = mapHandToScreen(frame.palmX, frame.palmY)
                     handPointTargetX = targetX
                     if (mood == PetMood.SLEEP) {
                         mood = PetMood.RUN
@@ -447,6 +465,29 @@ class EmotionalPetPhysics(
 
     fun endDrag() {
         if (mood != PetMood.DRAGGED) return
+
+        // Support fling-to-edge or release-at-edge Android -> PC handoff
+        if (edgeHandoffEnabled && onEdgeHandoff != null && !edgeHandoffFired) {
+            val maxX = (screenWidth - petSizePx).coerceAtLeast(0f)
+            val normY = ((y + petSizePx * 0.5f) / screenHeight.coerceAtLeast(1f)).coerceIn(0f, 1f)
+            val flingEdge = when {
+                vx <= -550f && x <= screenWidth * 0.28f -> "left"
+                vx >= 550f && x >= maxX - screenWidth * 0.28f -> "right"
+                vy <= -550f && y <= screenHeight * 0.25f -> "top"
+                edgeDwellEdge != null && edgeDwellSec >= 0.12f -> edgeDwellEdge
+                else -> null
+            }
+            if (flingEdge != null) {
+                edgeHandoffFired = true
+                edgeDwellEdge = null
+                edgeDwellSec = 0f
+                onEdgeHandoff.invoke(flingEdge, normY)
+                mood = PetMood.JUMP
+                animationName = "handoff"
+                return
+            }
+        }
+
         edgeDwellEdge = null
         edgeDwellSec = 0f
         edgeHandoffFired = false
