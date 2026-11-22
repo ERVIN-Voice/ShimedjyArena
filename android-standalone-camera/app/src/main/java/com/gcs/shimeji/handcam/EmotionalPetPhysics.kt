@@ -140,9 +140,12 @@ class EmotionalPetPhysics(
     /** Expressive manual triggers for UI buttons or interactions. */
     fun petWithLove() {
         annoyanceScore = 0f
-        if (mood == PetMood.SLEEP || mood == PetMood.DIZZY || mood == PetMood.SPLAT) {
+        if (mood == PetMood.SLEEP || mood == PetMood.DIZZY || mood == PetMood.SPLAT || mood == PetMood.TUMBLING) {
             mood = PetMood.IDLE
+            vx = 0f
+            vy = 0f
             rotationDeg = 0f
+            angularVelocityDeg = 0f
         }
         scaleX = 1.18f
         scaleY = 0.86f
@@ -249,17 +252,22 @@ class EmotionalPetPhysics(
             HandGesture.PINCH -> {
                 fistHoldSec = 0f
                 handPointTargetX = null
-                val targetX = (frame.palmX * (screenWidth - petSizePx)).coerceIn(0f, (screenWidth - petSizePx).coerceAtLeast(0f))
-                val targetY = (frame.palmY * (screenHeight - petSizePx)).coerceIn(0f, (screenHeight - petSizePx).coerceAtLeast(0f))
+                val maxX = (screenWidth - petSizePx).coerceAtLeast(0f)
+                val maxY = (screenHeight - petSizePx).coerceAtLeast(0f)
+                val targetX = (frame.palmX * maxX).coerceIn(0f, maxX)
+                val targetY = (frame.palmY * maxY).coerceIn(0f, maxY)
                 if (!isHandGrabbing) {
                     isHandGrabbing = true
                     startDrag(targetX, targetY)
                     setEmotion(PetEmotion.SCARED, 2.0f, "Ой! 🤏")
                 }
-                val follow = (dt * 12f).coerceIn(0.12f, 0.65f)
+                val follow = (dt * 12f).coerceIn(0.12f, 0.55f)
                 val dx = (targetX - x) * follow
                 val dy = (targetY - y) * follow
                 updateDrag(dx, dy, dt.coerceAtLeast(0.016f))
+                // Cap pinch velocity so initial snap-to-hand doesn't launch at extreme speed
+                vx = vx.coerceIn(-950f, 950f)
+                vy = vy.coerceIn(-950f, 950f)
             }
 
             HandGesture.OPEN_PALM -> {
