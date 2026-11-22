@@ -10,11 +10,14 @@ in a mobile browser with zero internet access.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
+
+from PIL import Image
 
 from shared.config_loader import PROJECT_ROOT, load_avatar_config, load_protocol_config
 
@@ -131,6 +134,21 @@ class LocalWebServer:
             await self._send_response(writer, 200, "OK", payload, "application/json; charset=utf-8", head_only=head_only)
             return
 
+        if path == "/assets/avatar/icon.png":
+            icon_bytes = self._build_app_icon_png()
+            if icon_bytes is not None:
+                await self._send_response(
+                    writer,
+                    200,
+                    "OK",
+                    icon_bytes,
+                    "image/png",
+                    head_only=head_only,
+                )
+                return
+            await self._send_response(writer, 404, "Not Found", b"Icon not available", "text/plain; charset=utf-8", head_only=head_only)
+            return
+
         if path == "/assets/avatar/spritesheet.png":
             avatar_cfg = load_avatar_config()
             sheet_path = avatar_cfg.visual.sprite_sheet
@@ -173,6 +191,25 @@ class LocalWebServer:
             content_type,
             head_only=head_only,
         )
+
+    def _build_app_icon_png(self) -> bytes | None:
+        avatar_cfg = load_avatar_config()
+        sheet_path = avatar_cfg.visual.sprite_sheet
+        if not sheet_path.is_file():
+            return None
+        fw = avatar_cfg.visual.frame_width
+        fh = avatar_cfg.visual.frame_height
+        idle = avatar_cfg.animations.get("idle")
+        row = idle.row if idle is not None else 0
+        with Image.open(sheet_path) as sheet:
+            rgba = sheet.convert("RGBA")
+            frame = rgba.crop((0, row * fh, fw, (row + 1) * fh))
+        canvas = Image.new("RGBA", (192, 192), (15, 20, 32, 255))
+        scaled = frame.resize((160, 160), Image.Resampling.NEAREST)
+        canvas.alpha_composite(scaled, (16, 16))
+        buf = io.BytesIO()
+        canvas.save(buf, format="PNG")
+        return buf.getvalue()
 
     def _build_api_config(self) -> dict[str, Any]:
         avatar_cfg = load_avatar_config()

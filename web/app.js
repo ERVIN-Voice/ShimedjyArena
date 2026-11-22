@@ -26,6 +26,21 @@
   const edgeLeft = document.getElementById("edgeLeft");
   const edgeRight = document.getElementById("edgeRight");
   const edgeTop = document.getElementById("edgeTop");
+  const fullscreenBtn = document.getElementById("fullscreenBtn");
+
+  // Show one-tap fullscreen button when opened in a regular mobile browser (not WebView/standalone)
+  const isStandalone = window.matchMedia && window.matchMedia("(display-mode: standalone)").matches;
+  const isAndroidWebView = Boolean(window.GcsAndroidBridge);
+  if (fullscreenBtn && !isStandalone && !isAndroidWebView && document.documentElement.requestFullscreen) {
+    fullscreenBtn.classList.remove("hidden");
+    fullscreenBtn.addEventListener("click", () => {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    });
+  }
 
   const DEFAULT_ANIMS = {
     idle: { row: 0, frames: 4, fps: 4, loop: true },

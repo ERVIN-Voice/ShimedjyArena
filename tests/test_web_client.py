@@ -75,11 +75,22 @@ async def test_hub_serves_android_web_client_assets_and_api_config() -> None:
         assert "idle" in cfg["avatar_config"]["animations"]
         assert "receive" in cfg["avatar_config"]["animations"]
 
-        # 5) Active sprite sheet PNG served cleanly
+        # 5) Active sprite sheet PNG + dynamic 192x192 PWA icon served cleanly
         status, headers, body = await _http_get("127.0.0.1", hub.actual_web_port, "/assets/avatar/spritesheet.png")
         assert status == 200
         assert headers.get("content-type") == "image/png"
         assert body.startswith(b"\x89PNG\r\n\x1a\n")
+
+        status, headers, body = await _http_get("127.0.0.1", hub.actual_web_port, "/assets/avatar/icon.png")
+        assert status == 200
+        assert headers.get("content-type") == "image/png"
+        assert body.startswith(b"\x89PNG\r\n\x1a\n")
+
+        status, headers, body = await _http_get("127.0.0.1", hub.actual_web_port, "/manifest.json")
+        assert status == 200
+        manifest = json.loads(body.decode("utf-8"))
+        assert manifest["display"] == "standalone"
+        assert manifest["icons"][0]["src"] == "/assets/avatar/icon.png"
 
         # 6) Health endpoint + path traversal protection
         status, _, body = await _http_get("127.0.0.1", hub.actual_web_port, "/health")

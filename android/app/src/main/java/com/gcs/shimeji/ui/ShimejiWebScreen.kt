@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -105,7 +107,9 @@ class GcsAndroidBridge(
 
     @JavascriptInterface
     fun onConnectionStatus(status: String, message: String) {
-        onStatusUpdate(status, message)
+        Handler(Looper.getMainLooper()).post {
+            onStatusUpdate(status, message)
+        }
     }
 }
 
