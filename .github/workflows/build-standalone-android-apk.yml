@@ -1,0 +1,66 @@
+name: Build Standalone Android Overlay APK
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "android-standalone/**"
+      - ".github/workflows/build-standalone-android-apk.yml"
+  pull_request:
+    paths:
+      - "android-standalone/**"
+      - ".github/workflows/build-standalone-android-apk.yml"
+  workflow_dispatch:
+
+jobs:
+  build-standalone-apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: android-standalone
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Run standalone physics unit tests & build Debug APK
+        run: |
+          gradle testDebugUnitTest assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/Shimeji-Overlay-Standalone.apk
+
+      - name: Upload Shimeji-Overlay-Standalone.apk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shimeji-Overlay-Standalone-APK
+          path: android-standalone/app/build/outputs/apk/debug/Shimeji-Overlay-Standalone.apk
+          if-no-files-found: error
+
+      - name: Publish direct-download APK to GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APK="app/build/outputs/apk/debug/Shimeji-Overlay-Standalone.apk"
+          TAG="android-overlay-latest"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "Shimeji Overlay Standalone (Android APK)" \
+              --notes "Отдельное Android-приложение поверх экрана со смешной физикой падения при повороте телефона. Скачайте и установите Shimeji-Overlay-Standalone.apk прямо на телефон."
+          fi
