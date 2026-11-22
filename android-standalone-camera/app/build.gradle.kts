@@ -77,5 +77,9 @@ dependencies {
     // On-device 21-point MediaPipe Hand Landmarker (100% offline)
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
 
+    // Native LAN WebSocket sync with PC GCS Local Hub
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

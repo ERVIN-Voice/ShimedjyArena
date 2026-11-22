@@ -16,6 +16,7 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Build
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -24,6 +25,7 @@ import android.util.DisplayMetrics
 import android.view.Choreographer
 import android.view.Gravity
 import android.view.Surface
+import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
@@ -39,6 +41,7 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
     private lateinit var sensorManager: SensorManager
     private lateinit var prefs: HandCamPreferences
     private lateinit var settings: HandCamSettings
+    private lateinit var deviceId: String
     private lateinit var spriteSheet: PixelSpriteSheet
     private lateinit var physics: EmotionalPetPhysics
     private lateinit var petView: EmotionalPetOverlayView
@@ -46,6 +49,16 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
 
     private var cameraTracker: CameraHandTracker? = null
     private val latestHandFrame = AtomicReference<HandGestureFrame?>(null)
+
+    // Unified PC Hub Sync + Handoff overlay state
+    private var hubClient: HubSyncClient? = null
+    private var offerOverlayView: HandoffOfferOverlayView? = null
+    private var offerAttached = false
+    private var pendingIncomingOffer: HubEvent.HandoffOffer? = null
+    private var isLocalOwner: Boolean = true
+    private var isHandoffPendingOutgoing: Boolean = false
+    private var hasOnlinePcPeer: Boolean = false
+    private var lastHubStateSentMs: Long = 0L
 
     private var usingAccelerometerFallback = false
     private val filteredGravity = floatArrayOf(0f, 9.81f, 0f)
@@ -63,6 +76,7 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         prefs = HandCamPreferences(this)
         settings = prefs.load()
+        deviceId = prefs.getOrCreateDeviceId()
 
         startForegroundSafely()
 
@@ -81,6 +95,7 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
             screenHeight = bounds.height.toFloat(),
             petSizePx = petPx.toFloat(),
             onBonk = { impactSpeed -> vibrateBonk(impactSpeed) },
+            onEdgeHandoff = { edge, normY -> triggerOutgoingHandoff(edge, normY) },
         )
         applySettingsToPhysics()
 
@@ -94,12 +109,7 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
         petView.showGestureBadge = settings.showGestureBadge
 
         val windowSize = petPx + petView.paddingPx * 2
-        val windowType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
-        }
+        val windowType = overlayWindowType()
 
         layoutParams = WindowManager.LayoutParams(
             windowSize,
@@ -130,10 +140,31 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
             },
         )
 
+        hubClient = HubSyncClient(
+            deviceId = deviceId,
+            screenWidth = bounds.width,
+            screenHeight = bounds.height,
+            onEvent = { event -> handleHubEvent(event) },
+            onConnectionStateChanged = { connected, statusLabel ->
+                HandCamRuntimeState.setHubState(connected, statusLabel)
+                if (!connected) {
+                    hasOnlinePcPeer = false
+                    HandCamRuntimeState.setHasPcPeer(false)
+                    dismissIncomingOfferOverlay()
+                    if (!settings.pcSyncEnabled) {
+                        setPetOwnedLocally(true)
+                    }
+                    updateEdgeHandoffEligibility()
+                }
+            },
+        )
+
         registerGravitySensor()
         syncCameraState()
+        syncHubConnection()
         startFrameLoop()
-        OverlayRuntimeFlag.setRunning(true)
+        HandCamRuntimeState.setRunning(true)
+        HandCamRuntimeState.setPetOwnedLocally(true)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -157,14 +188,21 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
                     layoutParams.height = newWinSize
                     syncWindowPosition()
                     syncCameraState()
+                    syncHubConnection()
                 }
             }
 
-            ACTION_TEST_FALL -> if (viewAttached) physics.triggerFunnyFall(if (physics.facingRight) 1f else -1f)
-            ACTION_EMOTE_LOVE -> if (viewAttached) physics.petWithLove()
-            ACTION_EMOTE_HAPPY -> if (viewAttached) physics.triggerHappyJump()
-            ACTION_EMOTE_ANGRY -> if (viewAttached) physics.makeAngry()
-            ACTION_EMOTE_SLEEP -> if (viewAttached) physics.putToSleep()
+            ACTION_SEND_TO_PC -> {
+                if (viewAttached) {
+                    triggerOutgoingHandoff(edge = "right", normalizedY = 0.5f)
+                }
+            }
+
+            ACTION_TEST_FALL -> if (viewAttached && isLocalOwner) physics.triggerFunnyFall(if (physics.facingRight) 1f else -1f)
+            ACTION_EMOTE_LOVE -> if (viewAttached && isLocalOwner) physics.petWithLove()
+            ACTION_EMOTE_HAPPY -> if (viewAttached && isLocalOwner) physics.triggerHappyJump()
+            ACTION_EMOTE_ANGRY -> if (viewAttached && isLocalOwner) physics.makeAngry()
+            ACTION_EMOTE_SLEEP -> if (viewAttached && isLocalOwner) physics.putToSleep()
         }
         return START_STICKY
     }
@@ -179,16 +217,21 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
         physics.updateScreenBounds(
             newWidth = bounds.width.toFloat(),
             newHeight = bounds.height.toFloat(),
-            triggerRotationTumble = rotated,
+            triggerRotationTumble = rotated && isLocalOwner,
         )
         syncWindowPosition()
     }
 
     override fun onDestroy() {
-        OverlayRuntimeFlag.setRunning(false)
+        HandCamRuntimeState.setRunning(false)
         HandCamRuntimeState.setCameraStatus("Остановлена")
         HandCamRuntimeState.setGestureLabel("Рука не в кадре")
+        HandCamRuntimeState.setHubState(false, "Остановлена")
+        HandCamRuntimeState.setHasPcPeer(false)
         stopFrameLoop()
+        dismissIncomingOfferOverlay()
+        runCatching { hubClient?.disconnect() }
+        hubClient = null
         runCatching { cameraTracker?.stop() }
         cameraTracker = null
         runCatching { sensorManager.unregisterListener(this) }
@@ -197,6 +240,222 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
             viewAttached = false
         }
         super.onDestroy()
+    }
+
+    private fun overlayWindowType(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+    }
+
+    private fun syncHubConnection() {
+        val client = hubClient ?: return
+        if (!settings.pcSyncEnabled) {
+            client.disconnect()
+            isHandoffPendingOutgoing = false
+            setPetOwnedLocally(true)
+            updateEdgeHandoffEligibility()
+            return
+        }
+        if (settings.pcHubUrl.isBlank()) {
+            client.disconnect()
+            HandCamRuntimeState.setHubState(false, "Укажите IP ПК или нажмите «Найти ПК в Wi-Fi»")
+            updateEdgeHandoffEligibility()
+            return
+        }
+        client.connect(settings.pcHubUrl)
+    }
+
+    private fun updateEdgeHandoffEligibility() {
+        physics.edgeHandoffEnabled = settings.pcSyncEnabled &&
+            (hubClient?.isConnected == true) &&
+            hasOnlinePcPeer &&
+            isLocalOwner &&
+            !isHandoffPendingOutgoing
+    }
+
+    private fun setPetOwnedLocally(owned: Boolean) {
+        isLocalOwner = owned
+        HandCamRuntimeState.setPetOwnedLocally(owned)
+        if (viewAttached) {
+            petView.visibility = if (owned && !isHandoffPendingOutgoing) View.VISIBLE else View.GONE
+        }
+        updateEdgeHandoffEligibility()
+    }
+
+    private fun triggerOutgoingHandoff(edge: String, normalizedY: Float) {
+        val client = hubClient ?: return
+        if (!settings.pcSyncEnabled || !client.isConnected || !isLocalOwner || !hasOnlinePcPeer || isHandoffPendingOutgoing) {
+            return
+        }
+        // Push latest emotion/position right before handoff so PC receives exact emotion
+        client.sendStateUpdate(
+            x = physics.x,
+            y = physics.y,
+            animation = physics.animationName,
+            state = physics.protocolState(),
+            facing = physics.protocolFacing(),
+            emotion = physics.emotion,
+        )
+        if (client.sendHandoffRequest(edge = edge, normalizedY = normalizedY)) {
+            isHandoffPendingOutgoing = true
+            petView.visibility = View.GONE
+            updateEdgeHandoffEligibility()
+        }
+    }
+
+    private fun handleHubEvent(event: HubEvent) {
+        when (event) {
+            is HubEvent.RegisterAck -> {
+                updatePeerPresence(event.devices)
+                applyAuthoritativeState(event.avatarState)
+            }
+
+            is HubEvent.DeviceList -> {
+                updatePeerPresence(event.devices)
+            }
+
+            is HubEvent.StateSync -> {
+                applyAuthoritativeState(event.avatarState)
+            }
+
+            is HubEvent.HandoffPending -> {
+                if (event.sourceDeviceId == deviceId) {
+                    isHandoffPendingOutgoing = true
+                    petView.visibility = View.GONE
+                    updateEdgeHandoffEligibility()
+                }
+            }
+
+            is HubEvent.HandoffOffer -> {
+                pendingIncomingOffer = event
+                showIncomingOfferOverlay(event)
+            }
+
+            is HubEvent.HandoffComplete -> {
+                dismissIncomingOfferOverlay()
+                isHandoffPendingOutgoing = false
+                if (event.newOwner == deviceId) {
+                    val incomingEmo = HubProtocolCodec.petEmotionFromProtocol(event.emotion)
+                    physics.receiveFromHub(event.edge, event.normalizedY, incomingEmo)
+                    setPetOwnedLocally(true)
+                    syncWindowPosition()
+                } else {
+                    setPetOwnedLocally(false)
+                }
+            }
+
+            is HubEvent.HandoffCancel -> {
+                dismissIncomingOfferOverlay()
+                isHandoffPendingOutgoing = false
+                if (event.restoredOwner == deviceId) {
+                    setPetOwnedLocally(true)
+                    physics.setEmotion(
+                        HubProtocolCodec.petEmotionFromProtocol(event.emotion),
+                        2.5f,
+                        "Вернулся!",
+                    )
+                } else if (event.restoredOwner != null) {
+                    setPetOwnedLocally(false)
+                }
+            }
+
+            is HubEvent.Error -> {
+                if (isHandoffPendingOutgoing) {
+                    isHandoffPendingOutgoing = false
+                    setPetOwnedLocally(true)
+                }
+            }
+
+            is HubEvent.Ping, HubEvent.Ignored -> Unit
+        }
+    }
+
+    private fun updatePeerPresence(devices: List<HubDeviceInfo>) {
+        hasOnlinePcPeer = devices.any { it.connected && it.deviceId != deviceId }
+        HandCamRuntimeState.setHasPcPeer(hasOnlinePcPeer)
+        updateEdgeHandoffEligibility()
+    }
+
+    private fun applyAuthoritativeState(state: HubAvatarState) {
+        if (!settings.pcSyncEnabled) return
+        val weOwn = state.owner == deviceId
+        if (weOwn) {
+            isHandoffPendingOutgoing = state.state == "HANDOFF_PENDING"
+            setPetOwnedLocally(true)
+            if (isHandoffPendingOutgoing && viewAttached) {
+                petView.visibility = View.GONE
+            }
+        } else if (state.owner != null) {
+            isHandoffPendingOutgoing = false
+            setPetOwnedLocally(false)
+        }
+    }
+
+    private fun showIncomingOfferOverlay(offer: HubEvent.HandoffOffer) {
+        if (!viewAttached) return
+        dismissIncomingOfferOverlay()
+        val banner = HandoffOfferOverlayView(
+            context = this,
+            onAcceptTouch = { confirmIncomingOffer(accepted = true, source = "touch") },
+            onDeclineTouch = { confirmIncomingOffer(accepted = false, source = "touch") },
+        )
+        banner.bindOffer(offer.sourceDeviceName, offer.edge, offer.timeoutSeconds)
+
+        val d = resources.displayMetrics.density
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = topInsetPx + (18 * d).roundToInt()
+        }
+        runCatching {
+            windowManager.addView(banner, lp)
+            offerOverlayView = banner
+            offerAttached = true
+        }
+    }
+
+    private fun dismissIncomingOfferOverlay() {
+        pendingIncomingOffer = null
+        val banner = offerOverlayView
+        offerOverlayView = null
+        if (offerAttached && banner != null) {
+            runCatching { windowManager.removeView(banner) }
+        }
+        offerAttached = false
+    }
+
+    private fun confirmIncomingOffer(accepted: Boolean, source: String) {
+        val offer = pendingIncomingOffer ?: return
+        dismissIncomingOfferOverlay()
+        val client = hubClient ?: return
+        if (accepted) {
+            val incomingEmo = HubProtocolCodec.petEmotionFromProtocol(offer.emotion)
+            physics.receiveFromHub(offer.edge, offer.normalizedY, incomingEmo)
+            setPetOwnedLocally(true)
+            syncWindowPosition()
+            client.sendHandoffConfirm(
+                handoffId = offer.handoffId,
+                accepted = true,
+                confirmationSource = source,
+                landingX = physics.x,
+                landingY = physics.y,
+            )
+        } else {
+            client.sendHandoffConfirm(
+                handoffId = offer.handoffId,
+                accepted = false,
+                confirmationSource = source,
+            )
+        }
     }
 
     private fun hasCameraPermission(): Boolean {
@@ -219,7 +478,6 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
             HandCamRuntimeState.setGestureLabel("Дайте доступ к камере")
             return
         }
-        // Refresh foreground service type in case CAMERA permission was newly granted
         startForegroundSafely()
         cameraTracker?.start(frontCamera = settings.useFrontCamera)
     }
@@ -256,20 +514,50 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
         }
         lastFrameNanos = frameTimeNanos
 
-        if (settings.cameraControlEnabled) {
-            val handFrame = latestHandFrame.get()
-            if (handFrame != null) {
-                petView.activeGesture = handFrame.gesture
-                physics.applyHandGesture(handFrame, dt)
-            } else {
-                petView.activeGesture = HandGesture.NONE
+        // Check incoming handoff offer timeout + hands-free camera Open Palm confirmation
+        val activeOffer = pendingIncomingOffer
+        if (activeOffer != null) {
+            val nowSec = System.currentTimeMillis() / 1000.0
+            if (nowSec > activeOffer.expiresAtSec) {
+                dismissIncomingOfferOverlay()
+            } else if (settings.cameraControlEnabled) {
+                val handFrame = latestHandFrame.get()
+                if (handFrame != null && handFrame.detected && handFrame.gesture == HandGesture.OPEN_PALM) {
+                    confirmIncomingOffer(accepted = true, source = "gesture")
+                }
             }
         }
 
-        physics.step(dt)
-        HandCamRuntimeState.setEmotion(physics.emotion)
-        petView.advanceAnimation(dt)
-        syncWindowPosition()
+        if (isLocalOwner && !isHandoffPendingOutgoing) {
+            if (settings.cameraControlEnabled) {
+                val handFrame = latestHandFrame.get()
+                if (handFrame != null) {
+                    petView.activeGesture = handFrame.gesture
+                    physics.applyHandGesture(handFrame, dt)
+                } else {
+                    petView.activeGesture = HandGesture.NONE
+                }
+            }
+
+            physics.step(dt)
+            HandCamRuntimeState.setEmotion(physics.emotion)
+            petView.advanceAnimation(dt)
+            syncWindowPosition()
+
+            // Throttled live state & emotion sync to PC Hub (~8 Hz)
+            val nowMs = SystemClock.uptimeMillis()
+            if (settings.pcSyncEnabled && hubClient?.isConnected == true && nowMs - lastHubStateSentMs >= 125L) {
+                lastHubStateSentMs = nowMs
+                hubClient?.sendStateUpdate(
+                    x = physics.x,
+                    y = physics.y,
+                    animation = physics.animationName,
+                    state = physics.protocolState(),
+                    facing = physics.protocolFacing(),
+                    emotion = physics.emotion,
+                )
+            }
+        }
 
         Choreographer.getInstance().postFrameCallback(this)
     }
@@ -300,7 +588,7 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        if (event == null || !viewAttached) return
+        if (event == null || !viewAttached || !isLocalOwner || isHandoffPendingOutgoing) return
         val rawX = event.values[0]
         val rawY = event.values[1]
         val rawZ = event.values[2]
@@ -418,7 +706,7 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
                 "Shimeji Hand Cam поверх экрана",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply {
-                description = "Пиксельный чубрик с эмоциями и управлением ладонью через камеру"
+                description = "Пиксельный чубрик поверх экрана + камера жестов + синхронизация с ПК"
             }
             manager.createNotificationChannel(channel)
         }
@@ -427,6 +715,12 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
             this,
             0,
             Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val sendPcIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, ShimejiHandCamService::class.java).apply { action = ACTION_SEND_TO_PC },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val stopIntent = PendingIntent.getService(
@@ -438,10 +732,11 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.star_on)
-            .setContentTitle("Чубрик поверх экрана + Камера")
-            .setContentText("Управляйте ладонью, наклоняйте телефон и играйте с эмоциями!")
+            .setContentTitle("Shimeji — Единая система (Телефон + ПК)")
+            .setContentText("Жесты ладонью, эмоции и перенос чубрика на ПК по Wi-Fi")
             .setOngoing(true)
             .setContentIntent(openAppIntent)
+            .addAction(android.R.drawable.ic_menu_send, "На ПК", sendPcIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Выключить", stopIntent)
             .build()
 
@@ -466,6 +761,7 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
         const val ACTION_START = "com.gcs.shimeji.handcam.ACTION_START"
         const val ACTION_STOP = "com.gcs.shimeji.handcam.ACTION_STOP"
         const val ACTION_RELOAD_SETTINGS = "com.gcs.shimeji.handcam.ACTION_RELOAD_SETTINGS"
+        const val ACTION_SEND_TO_PC = "com.gcs.shimeji.handcam.ACTION_SEND_TO_PC"
         const val ACTION_TEST_FALL = "com.gcs.shimeji.handcam.ACTION_TEST_FALL"
         const val ACTION_EMOTE_LOVE = "com.gcs.shimeji.handcam.ACTION_EMOTE_LOVE"
         const val ACTION_EMOTE_HAPPY = "com.gcs.shimeji.handcam.ACTION_EMOTE_HAPPY"
@@ -495,8 +791,4 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
             context.startService(intent)
         }
     }
-}
-
-private object OverlayRuntimeFlag {
-    fun setRunning(running: Boolean) = HandCamRuntimeState.setRunning(running)
 }

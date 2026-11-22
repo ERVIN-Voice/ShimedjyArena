@@ -228,6 +228,7 @@ class WindowsHubClient:
         animation: str,
         state: str,
         facing: str,
+        emotion: str = "neutral",
     ) -> bool:
         return self.send_message(
             "state_update",
@@ -237,6 +238,7 @@ class WindowsHubClient:
                 "animation": animation,
                 "state": state,
                 "facing": facing,
+                "emotion": emotion,
             },
         )
 

@@ -70,6 +70,19 @@ def _make_21_skeleton(pose: str, cx: float = 0.5, cy: float = 0.6) -> list[Point
         middle = [middle_mcp, Point2D(cx - 0.01, cy - 0.02), Point2D(cx - 0.01, cy + 0.03), Point2D(cx - 0.01, cy + 0.06)]
         ring = [ring_mcp, Point2D(cx + 0.04, cy - 0.01), Point2D(cx + 0.04, cy + 0.04), Point2D(cx + 0.04, cy + 0.07)]
         pinky = [pinky_mcp, Point2D(cx + 0.08, cy + 0.01), Point2D(cx + 0.08, cy + 0.05), Point2D(cx + 0.08, cy + 0.08)]
+    elif pose == "peace":
+        thumb = [thumb_cmc, thumb_mcp, Point2D(cx - 0.06, cy + 0.03), Point2D(cx - 0.04, cy + 0.04)]
+        index = [index_mcp, Point2D(cx - 0.07, cy - 0.09), Point2D(cx - 0.09, cy - 0.16), Point2D(cx - 0.11, cy - 0.23)]
+        middle = [middle_mcp, Point2D(cx + 0.01, cy - 0.10), Point2D(cx + 0.03, cy - 0.17), Point2D(cx + 0.05, cy - 0.24)]
+        ring = [ring_mcp, Point2D(cx + 0.04, cy - 0.01), Point2D(cx + 0.04, cy + 0.04), Point2D(cx + 0.04, cy + 0.07)]
+        pinky = [pinky_mcp, Point2D(cx + 0.08, cy + 0.01), Point2D(cx + 0.08, cy + 0.05), Point2D(cx + 0.08, cy + 0.08)]
+    elif pose == "tight_fist":
+        # Thumb pressed tightly against curled index (tricky real-world case that used to misfire PINCH)
+        thumb = [thumb_cmc, thumb_mcp, Point2D(cx - 0.06, cy + 0.04), Point2D(cx - 0.052, cy + 0.065)]
+        index = [index_mcp, Point2D(cx - 0.06, cy - 0.02), Point2D(cx - 0.06, cy + 0.03), Point2D(cx - 0.05, cy + 0.07)]
+        middle = [middle_mcp, Point2D(cx - 0.01, cy - 0.02), Point2D(cx - 0.01, cy + 0.03), Point2D(cx - 0.01, cy + 0.07)]
+        ring = [ring_mcp, Point2D(cx + 0.04, cy - 0.01), Point2D(cx + 0.04, cy + 0.04), Point2D(cx + 0.04, cy + 0.07)]
+        pinky = [pinky_mcp, Point2D(cx + 0.08, cy + 0.01), Point2D(cx + 0.08, cy + 0.05), Point2D(cx + 0.07, cy + 0.08)]
     else:  # fist
         thumb = [thumb_cmc, thumb_mcp, Point2D(cx - 0.04, cy + 0.04), Point2D(cx - 0.01, cy + 0.05)]
         index = [index_mcp, Point2D(cx - 0.06, cy - 0.02), Point2D(cx - 0.06, cy + 0.03), Point2D(cx - 0.05, cy + 0.07)]
@@ -78,6 +91,22 @@ def _make_21_skeleton(pose: str, cx: float = 0.5, cy: float = 0.6) -> list[Point
         pinky = [pinky_mcp, Point2D(cx + 0.08, cy + 0.01), Point2D(cx + 0.08, cy + 0.05), Point2D(cx + 0.07, cy + 0.08)]
 
     return [wrist, *thumb, *index, *middle, *ring, *pinky]
+
+
+def _rotate_skeleton(pts: list[Point2D], angle_deg: float) -> list[Point2D]:
+    import math
+
+    rad = math.radians(angle_deg)
+    ca, sa = math.cos(rad), math.sin(rad)
+    cx = sum(p.x for p in pts) / len(pts)
+    cy = sum(p.y for p in pts) / len(pts)
+    return [
+        Point2D(
+            x=cx + (p.x - cx) * ca - (p.y - cy) * sa,
+            y=cy + (p.x - cx) * sa + (p.y - cy) * ca,
+        )
+        for p in pts
+    ]
 
 
 def test_camera_capabilities_explicitly_non_depth() -> None:
@@ -430,5 +459,136 @@ def test_opencv_detector_rejects_noisy_beige_wall_without_whiteout() -> None:
     white_ratio = float(np.count_nonzero(res.mask_preview)) / float(res.mask_preview.size)
     assert white_ratio < 0.05
     assert isinstance(get_last_mediapipe_status(), str)
+
+
+def test_pc_high_precision_rotated_hands_fist_before_pinch_and_hysteresis() -> None:
+    """Verifies upgraded PC 21-point hand recognition accuracy across rotations,
+    FIST-vs-PINCH disambiguation, PEACE detection, pinch hysteresis, and One-Euro smoothing.
+    """
+    from windows.hand_detection import HandDetectionResult, HandDetector, OneEuroFilter
+
+    recognizer = GestureRecognizer(hold_frames=1)
+
+    # 1) All 5 gestures (plus tricky tight_fist) work even when rotated +35° or -45°!
+    for angle in (0.0, 35.0, -45.0):
+        for pose, expected in (
+            ("open_palm", GestureType.RECEIVE_PET),
+            ("pinch", GestureType.PINCH),
+            ("point", GestureType.POINT),
+            ("peace", GestureType.PEACE),
+            ("fist", GestureType.FIST),
+            ("tight_fist", GestureType.FIST),
+        ):
+            rotated = _rotate_skeleton(_make_21_skeleton(pose), angle)
+            hand = analyze_21_landmarks(rotated, confidence=0.95)
+            gesture, conf = recognizer.classify_hand(hand)
+            assert gesture == expected, f"angle={angle} pose={pose}: expected {expected}, got {gesture} ({hand})"
+            assert conf >= 0.60
+
+    # 2) Pinch hysteresis: stays locked during drag even if pinch_ratio loosens to 0.46
+    loose_pinch = HandDetectionResult(
+        detected=True,
+        confidence=0.92,
+        palm_center=Point2D(0.5, 0.5),
+        extended_fingers=3,
+        openness_score=0.55,
+        pinch_ratio=0.46,
+        tracker_name="mediapipe",
+        landmarks_21=tuple(_make_21_skeleton("pinch")),
+        finger_states=(False, False, True, True, True),
+        avg_tip_ratio=1.65,
+    )
+    g_fresh, _ = recognizer.classify_hand(loose_pinch, currently_pinching=False)
+    g_held, _ = recognizer.classify_hand(loose_pinch, currently_pinching=True)
+    assert g_fresh != GestureType.PINCH
+    assert g_held == GestureType.PINCH
+
+    # 3) 1-frame classification flicker immunity while hand stays detected
+    class _ScriptedDetector(HandDetector):
+        def __init__(self, seq: list[HandDetectionResult]) -> None:
+            self._seq = list(seq)
+            self._idx = 0
+
+        def detect(self, frame: CameraFrame) -> HandDetectionResult:
+            res = self._seq[min(self._idx, len(self._seq) - 1)]
+            self._idx += 1
+            return res
+
+    pinch_hand = analyze_21_landmarks(_make_21_skeleton("pinch"), confidence=0.95)
+    ambiguous_hand = HandDetectionResult(
+        detected=True,
+        confidence=0.85,
+        palm_center=Point2D(0.5, 0.5),
+        extended_fingers=2,
+        openness_score=0.45,
+        pinch_ratio=0.72,
+        tracker_name="mediapipe",
+        landmarks_21=tuple(_make_21_skeleton("point")),
+        finger_states=(True, False, True, False, False),
+        avg_tip_ratio=1.55,
+    )
+    rec_stable = GestureRecognizer(
+        detector=_ScriptedDetector([pinch_hand, pinch_hand, ambiguous_hand, pinch_hand]),
+        hold_frames=2,
+        miss_tolerance=1,
+    )
+    dummy_img = np.zeros((120, 160, 3), dtype=np.uint8)
+    evs = [
+        rec_stable.process_frame(CameraFrame(dummy_img, timestamp=1.0 + i * 0.033, frame_index=i, source_kind="synthetic"))
+        for i in range(4)
+    ]
+    assert evs[1].gesture == GestureType.PINCH
+    assert evs[2].gesture == GestureType.PINCH  # Bridged single ambiguous frame without dropping!
+    assert evs[3].gesture == GestureType.PINCH
+
+    # 4) One-Euro filter suppresses jitter when still while tracking fast jumps closely
+    flt = OneEuroFilter(min_cutoff=1.2, beta=0.2)
+    jitter_outputs = [flt.filter(0.50 + (0.015 if i % 2 == 0 else -0.015), 1.0 + i * 0.033) for i in range(15)]
+    jitter_spread = max(jitter_outputs[-6:]) - min(jitter_outputs[-6:])
+    assert jitter_spread < 0.012  # Heavily damped compared to 0.030 input oscillation!
+
+    fast_out = flt.filter(0.85, 1.55)
+    assert fast_out > 0.65  # Responds rapidly to fast movement
+
+
+def test_pc_peace_and_wave_drive_unified_love_emotion(tmp_path: Path) -> None:
+    from windows.hand_detection import HandDetector
+
+    class _PoseDetector(HandDetector):
+        def __init__(self) -> None:
+            self.pose = "peace"
+            self.cx = 0.5
+
+        def detect(self, frame: CameraFrame):
+            return analyze_21_landmarks(_make_21_skeleton(self.pose, cx=self.cx), confidence=0.95)
+
+    cfg = load_avatar_config()
+    bounds = DesktopBounds([ScreenRect(0, 0, 1280, 720, is_primary=True)])
+    engine = PetEngine(cfg, bounds, pet_width=128, pet_height=128, state_file=tmp_path / "state.json")
+    det = _PoseDetector()
+    rec = GestureRecognizer(detector=det, hold_frames=1)
+    gate = HandoffGestureConfirmationController(recognizer=rec)
+    ctrl = GesturePetController(engine, rec, gate)
+    dummy = np.zeros((120, 160, 3), dtype=np.uint8)
+
+    # PEACE -> joyful jump + LOVE emotion!
+    det.pose = "peace"
+    upd = ctrl.process_frame(CameraFrame(dummy, timestamp=10.0, frame_index=1, source_kind="synthetic"))
+    assert upd.event.gesture == GestureType.PEACE
+    assert engine.emotion == "love"
+    assert engine.animation == "jump"
+
+    # Let pet land & calm back to neutral
+    for _ in range(260):
+        engine.tick(1.0 / 60.0)
+    assert engine.emotion == "neutral"
+
+    # Fast sideways OPEN PALM wave -> pets with LOVE emotion!
+    det.pose = "open_palm"
+    for idx, x_pos in enumerate((0.30, 0.45, 0.62, 0.78)):
+        det.cx = x_pos
+        ctrl.process_frame(CameraFrame(dummy, timestamp=20.0 + idx * 0.05, frame_index=10 + idx, source_kind="synthetic"))
+    assert engine.emotion == "love"
+
 
 

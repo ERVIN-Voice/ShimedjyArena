@@ -94,6 +94,7 @@ class ProtocolConfig:
     avatar_states: frozenset[str] = field(default_factory=frozenset)
     animations: frozenset[str] = field(default_factory=frozenset)
     facing_values: frozenset[str] = field(default_factory=frozenset)
+    emotions: frozenset[str] = field(default_factory=frozenset)
     message_types: frozenset[str] = field(default_factory=frozenset)
 
 
@@ -212,6 +213,7 @@ def load_protocol_config(path: str | Path | None = None) -> ProtocolConfig:
         avatar_states=frozenset(enums["avatar_states"]),
         animations=frozenset(enums["animations"]),
         facing_values=frozenset(enums["facing"]),
+        emotions=frozenset(enums.get("emotions", ["neutral", "happy", "love", "excited", "scared", "dizzy", "angry", "sleepy"])),
         message_types=frozenset(raw["messages"].keys()),
     )
 

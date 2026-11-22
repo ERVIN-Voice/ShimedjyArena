@@ -57,6 +57,7 @@ class AvatarSnapshot:
     handoff_id: str | None
     version: int
     updated_at: float
+    emotion: str = "neutral"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +66,7 @@ class AvatarSnapshot:
             "animation": self.animation,
             "state": self.state,
             "facing": self.facing,
+            "emotion": self.emotion,
             "handoff_id": self.handoff_id,
             "version": self.version,
             "updated_at": self.updated_at,
@@ -78,6 +80,7 @@ class _PreHandoffBackup:
     animation: str
     state: str
     facing: str
+    emotion: str = "neutral"
 
 
 class AvatarStateStore:
@@ -95,6 +98,7 @@ class AvatarStateStore:
         self._animation: str = "idle"
         self._state: str = "ACTIVE"
         self._facing: str = "right"
+        self._emotion: str = "neutral"
         self._handoff_id: str | None = None
         self._version: int = 1
         self._updated_at: float = time.time()
@@ -113,6 +117,10 @@ class AvatarStateStore:
         return self._state
 
     @property
+    def emotion(self) -> str:
+        return self._emotion
+
+    @property
     def version(self) -> int:
         return self._version
 
@@ -127,6 +135,7 @@ class AvatarStateStore:
             handoff_id=self._handoff_id,
             version=self._version,
             updated_at=self._updated_at,
+            emotion=self._emotion,
         )
 
     def _bump_version(self) -> None:
@@ -154,6 +163,14 @@ class AvatarStateStore:
             )
         return facing
 
+    def _validate_emotion(self, emotion: str) -> str:
+        normalized = str(emotion).strip().lower()
+        if self._protocol.emotions and normalized not in self._protocol.emotions:
+            raise AvatarStateError(
+                f"Invalid emotion '{emotion}'. Allowed: {sorted(self._protocol.emotions)}"
+            )
+        return normalized
+
     def assign_owner_if_unowned(self, device_id: str) -> bool:
         """Assign initial owner only when no device currently owns the avatar."""
         if self._owner is not None:
@@ -161,6 +178,7 @@ class AvatarStateStore:
         self._owner = device_id
         self._state = "ACTIVE"
         self._animation = "idle"
+        self._emotion = "neutral"
         self._handoff_id = None
         self._bump_version()
         return True
@@ -173,6 +191,7 @@ class AvatarStateStore:
         animation: str | None = None,
         state: str | None = None,
         facing: str | None = None,
+        emotion: str | None = None,
     ) -> AvatarSnapshot:
         """Apply a state update strictly from the current owning device."""
         if self._owner != device_id:
@@ -197,6 +216,9 @@ class AvatarStateStore:
 
         if facing is not None:
             self._facing = self._validate_facing(facing)
+
+        if emotion is not None:
+            self._emotion = self._validate_emotion(emotion)
 
         if position is not None:
             if isinstance(position, dict):
@@ -229,6 +251,7 @@ class AvatarStateStore:
             animation=restorable_anim,
             state=restorable_state,
             facing=self._facing,
+            emotion=self._emotion,
         )
 
         self._handoff_id = handoff_id
@@ -279,6 +302,7 @@ class AvatarStateStore:
             self._animation = backup.animation
             self._state = backup.state
             self._facing = backup.facing
+            self._emotion = backup.emotion
         else:
             self._state = "ACTIVE"
             self._animation = "idle"

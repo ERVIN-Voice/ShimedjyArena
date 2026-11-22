@@ -561,6 +561,7 @@ class GCSLocalHub:
                 animation=payload.get("animation"),
                 state=payload.get("state"),
                 facing=payload.get("facing"),
+                emotion=payload.get("emotion"),
             )
         except (NotOwnerError, HandoffStateError, AvatarStateError, ValueError, TypeError) as exc:
             await self._send_error(websocket, "STATE_UPDATE_REJECTED", str(exc), ref_message_id=message_id)

@@ -32,6 +32,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -54,7 +55,10 @@ class MainActivity : ComponentActivity() {
 
     private val hasOverlayPermissionState = mutableStateOf(false)
     private val hasCameraPermissionState = mutableStateOf(false)
+    private val discoveryStatusState = mutableStateOf("")
+    private val discoveredUrlState = mutableStateOf("")
     private lateinit var prefs: HandCamPreferences
+    private var nsdDiscovery: HubNsdDiscovery? = null
 
     private val runtimePermissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
@@ -73,14 +77,30 @@ class MainActivity : ComponentActivity() {
         prefs = HandCamPreferences(this)
         refreshPermissions()
 
+        nsdDiscovery = HubNsdDiscovery(
+            context = this,
+            onHubFound = { wsUrl, _ ->
+                discoveredUrlState.value = wsUrl
+                val updated = prefs.load().copy(pcHubUrl = wsUrl, pcSyncEnabled = true)
+                prefs.save(updated)
+                ShimejiHandCamService.sendAction(this, ShimejiHandCamService.ACTION_RELOAD_SETTINGS)
+            },
+            onStatus = { status ->
+                discoveryStatusState.value = status
+            },
+        )
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 HandCamControlScreen(
                     hasOverlayPermission = hasOverlayPermissionState.value,
                     hasCameraPermission = hasCameraPermissionState.value,
                     initialSettings = prefs.load(),
+                    discoveryStatus = discoveryStatusState.value,
+                    discoveredUrl = discoveredUrlState.value,
                     onRequestOverlayPermission = { openOverlayPermissionSettings() },
                     onRequestCameraPermission = { requestCameraAndNotificationPermissions() },
+                    onDiscoverPc = { nsdDiscovery?.startDiscovery() },
                     onToggleOverlay = { currentlyRunning ->
                         if (currentlyRunning) {
                             ShimejiHandCamService.stop(this)
@@ -103,6 +123,11 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         refreshPermissions()
+    }
+
+    override fun onDestroy() {
+        nsdDiscovery?.stopDiscovery()
+        super.onDestroy()
     }
 
     private fun refreshPermissions() {
@@ -168,8 +193,11 @@ private fun HandCamControlScreen(
     hasOverlayPermission: Boolean,
     hasCameraPermission: Boolean,
     initialSettings: HandCamSettings,
+    discoveryStatus: String,
+    discoveredUrl: String,
     onRequestOverlayPermission: () -> Unit,
     onRequestCameraPermission: () -> Unit,
+    onDiscoverPc: () -> Unit,
     onToggleOverlay: (currentlyRunning: Boolean) -> Unit,
     onAction: (String) -> Unit,
     onSettingsChanged: (HandCamSettings) -> Unit,
@@ -178,8 +206,15 @@ private fun HandCamControlScreen(
     val currentEmotion by HandCamRuntimeState.emotion.collectAsState()
     val gestureLabel by HandCamRuntimeState.gestureLabel.collectAsState()
     val cameraStatus by HandCamRuntimeState.cameraStatus.collectAsState()
+    val hubConnected by HandCamRuntimeState.hubConnected.collectAsState()
+    val hubStatus by HandCamRuntimeState.hubStatus.collectAsState()
+    val hasPcPeer by HandCamRuntimeState.hasPcPeer.collectAsState()
+    val petOwnedLocally by HandCamRuntimeState.petOwnedLocally.collectAsState()
 
     var settings by remember { mutableStateOf(initialSettings) }
+    var urlInput by remember(discoveredUrl) {
+        mutableStateOf(if (discoveredUrl.isNotBlank()) discoveredUrl else settings.pcHubUrl)
+    }
 
     fun updateSettings(next: HandCamSettings) {
         settings = next
@@ -195,13 +230,13 @@ private fun HandCamControlScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         Text(
-            text = "Shimeji Hand Cam",
+            text = "GCS Shimeji — Телефон + ПК",
             color = Color(0xFF66FCF1),
-            fontSize = 26.sp,
+            fontSize = 24.sp,
             fontWeight = FontWeight.ExtraBold,
         )
         Text(
-            text = "Чубрик поверх всех приложений с живыми эмоциями, смешными падениями при повороте и управлением ладонью через камеру (100% оффлайн на телефоне).",
+            text = "Единый пиксельный чубрик: работает и автономно поверх всех приложений на телефоне (камера жестов + эмоции + падения), и в связке с ПК по Wi-Fi с переносом между экранами.",
             color = Color(0xFF93A7C8),
             fontSize = 13.sp,
             lineHeight = 19.sp,
@@ -276,8 +311,13 @@ private fun HandCamControlScreen(
                 modifier = Modifier.padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                val statusTitle = when {
+                    !isRunning -> "Статус: Выключен"
+                    settings.pcSyncEnabled && hubConnected && !petOwnedLocally -> "Статус: Чубрик сейчас гуляет на ПК 🖥️"
+                    else -> "Статус: Гуляет поверх экрана телефона 📱"
+                }
                 Text(
-                    text = if (isRunning) "Статус: Гуляет поверх экрана" else "Статус: Выключен",
+                    text = statusTitle,
                     color = if (isRunning) Color(0xFF4DE09D) else Color(0xFF93A7C8),
                     fontWeight = FontWeight.Bold,
                     fontSize = 15.sp,
@@ -314,6 +354,99 @@ private fun HandCamControlScreen(
             }
         }
 
+        // Unified PC Hub Sync card
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF152235)),
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    text = "Единая система: Связь с ПК (Wi-Fi)",
+                    color = Color(0xFF66FCF1),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Подключить к ПК (GCS Hub)", color = Color(0xFFEEF3FF), fontSize = 14.sp)
+                        Text(
+                            text = hubStatus,
+                            color = if (hubConnected) Color(0xFF4DE09D) else Color(0xFF93A7C8),
+                            fontSize = 12.sp,
+                        )
+                    }
+                    Switch(
+                        checked = settings.pcSyncEnabled,
+                        onCheckedChange = { enabled ->
+                            updateSettings(settings.copy(pcSyncEnabled = enabled, pcHubUrl = urlInput.trim()))
+                        },
+                    )
+                }
+
+                OutlinedTextField(
+                    value = urlInput,
+                    onValueChange = { urlInput = it },
+                    label = { Text("IP ПК или адрес Hub (например 192.168.1.10:8765)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = onDiscoverPc,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("🔍 Найти ПК в Wi-Fi", fontSize = 12.sp)
+                    }
+                    Button(
+                        onClick = {
+                            updateSettings(settings.copy(pcSyncEnabled = true, pcHubUrl = urlInput.trim()))
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF56C6E0)),
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Подключиться", color = Color(0xFF0A111A), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+
+                if (discoveryStatus.isNotBlank()) {
+                    Text(text = discoveryStatus, color = Color(0xFFFFD166), fontSize = 12.sp)
+                }
+
+                Button(
+                    onClick = { onAction(ShimejiHandCamService.ACTION_SEND_TO_PC) },
+                    enabled = isRunning && hubConnected && hasPcPeer && petOwnedLocally,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4DE09D)),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = if (petOwnedLocally) "📤 Отправить чубрика на ПК" else "Чубрик уже на ПК (перетащите к краю на ПК)",
+                        color = Color(0xFF0A111A),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                    )
+                }
+
+                Text(
+                    text = "Совет: чтобы перекинуть чубрика с телефона на ПК, потяните его пальцем к левому или правому краю экрана и подержите 0.5 сек. Чтобы принять с ПК — нажмите «Принять» или покажите ✋ ладонь камере!",
+                    color = Color(0xFF93A7C8),
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp,
+                )
+            }
+        }
+
         // Quick emotion & tumble test buttons
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF161D2E)),
@@ -335,23 +468,23 @@ private fun HandCamControlScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     OutlinedButton(
-                        enabled = isRunning,
+                        enabled = isRunning && petOwnedLocally,
                         onClick = { onAction(ShimejiHandCamService.ACTION_EMOTE_LOVE) },
                     ) { Text("♥ Погладить") }
                     OutlinedButton(
-                        enabled = isRunning,
+                        enabled = isRunning && petOwnedLocally,
                         onClick = { onAction(ShimejiHandCamService.ACTION_EMOTE_HAPPY) },
                     ) { Text("✨ Прыг!") }
                     OutlinedButton(
-                        enabled = isRunning,
+                        enabled = isRunning && petOwnedLocally,
                         onClick = { onAction(ShimejiHandCamService.ACTION_EMOTE_ANGRY) },
                     ) { Text("💢 Разозлить") }
                     OutlinedButton(
-                        enabled = isRunning,
+                        enabled = isRunning && petOwnedLocally,
                         onClick = { onAction(ShimejiHandCamService.ACTION_EMOTE_SLEEP) },
                     ) { Text("😴 Усыпить") }
                     OutlinedButton(
-                        enabled = isRunning,
+                        enabled = isRunning && petOwnedLocally,
                         onClick = { onAction(ShimejiHandCamService.ACTION_TEST_FALL) },
                     ) { Text("🌀 Уронить!") }
                 }
@@ -505,14 +638,14 @@ private fun HandCamControlScreen(
                 modifier = Modifier.padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(5.dp),
             ) {
-                Text("Жесты ладонью перед камерой:", color = Color(0xFF4DE09D), fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                Text("• 🤏 Щипок — схватить и таскать чубрика в воздухе (резко отпустить — полетит в кувырок!)", color = Color(0xFFCBD7EE), fontSize = 12.sp)
+                Text("Жесты ладонью (работают одинаково на телефоне и ПК):", color = Color(0xFF4DE09D), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Text("• 🤏 Щипок — схватить и таскать чубрика в воздухе", color = Color(0xFFCBD7EE), fontSize = 12.sp)
                 Text("• ✋ Помахать ладонью — погладить (♥ сердечки + румянец)", color = Color(0xFFCBD7EE), fontSize = 12.sp)
+                Text("• ✋ Показать ладонь при переносе — принять чубрика с ПК!", color = Color(0xFF66FCF1), fontSize = 12.sp)
                 Text("• ✋ Взмах ладонью вверх — весёлый прыжок (✨)", color = Color(0xFFCBD7EE), fontSize = 12.sp)
                 Text("• ☝️ Указательный палец — позвать чубрика бежать к руке", color = Color(0xFFCBD7EE), fontSize = 12.sp)
-                Text("• ✌️ Два пальца (Peace) — радостный прыжок с сердечками", color = Color(0xFFCBD7EE), fontSize = 12.sp)
+                Text("• ✌️ Два пальца (Peace) — праздничный прыжок с сердечками", color = Color(0xFFCBD7EE), fontSize = 12.sp)
                 Text("• ✊ Удержать кулак — уложить спать (Zzz)", color = Color(0xFFCBD7EE), fontSize = 12.sp)
-                Text("• Если часто ронять/швырять — чубрик разозлится (💢), погладьте ладонью, чтобы успокоить!", color = Color(0xFFFFB8D9), fontSize = 12.sp)
             }
         }
 

@@ -4,6 +4,7 @@ import android.content.Context
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.UUID
 
 data class HandCamSettings(
     val scale: Int = 3,
@@ -14,6 +15,8 @@ data class HandCamSettings(
     val cameraControlEnabled: Boolean = true,
     val useFrontCamera: Boolean = true,
     val showGestureBadge: Boolean = true,
+    val pcSyncEnabled: Boolean = false,
+    val pcHubUrl: String = "",
 )
 
 object HandCamRuntimeState {
@@ -28,6 +31,18 @@ object HandCamRuntimeState {
 
     private val _cameraStatus = MutableStateFlow("Остановлена")
     val cameraStatus: StateFlow<String> = _cameraStatus.asStateFlow()
+
+    private val _hubConnected = MutableStateFlow(false)
+    val hubConnected: StateFlow<Boolean> = _hubConnected.asStateFlow()
+
+    private val _hubStatus = MutableStateFlow("Автономный режим (без ПК)")
+    val hubStatus: StateFlow<String> = _hubStatus.asStateFlow()
+
+    private val _hasPcPeer = MutableStateFlow(false)
+    val hasPcPeer: StateFlow<Boolean> = _hasPcPeer.asStateFlow()
+
+    private val _petOwnedLocally = MutableStateFlow(true)
+    val petOwnedLocally: StateFlow<Boolean> = _petOwnedLocally.asStateFlow()
 
     fun setRunning(running: Boolean) {
         _isRunning.value = running
@@ -44,10 +59,31 @@ object HandCamRuntimeState {
     fun setCameraStatus(status: String) {
         if (_cameraStatus.value != status) _cameraStatus.value = status
     }
+
+    fun setHubState(connected: Boolean, status: String) {
+        _hubConnected.value = connected
+        _hubStatus.value = status
+    }
+
+    fun setHasPcPeer(hasPeer: Boolean) {
+        _hasPcPeer.value = hasPeer
+    }
+
+    fun setPetOwnedLocally(owned: Boolean) {
+        _petOwnedLocally.value = owned
+    }
 }
 
 class HandCamPreferences(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    fun getOrCreateDeviceId(): String {
+        val existing = prefs.getString(KEY_DEVICE_ID, null)
+        if (!existing.isNullOrBlank()) return existing
+        val fresh = "and-${UUID.randomUUID().toString().replace("-", "").take(10)}"
+        prefs.edit().putString(KEY_DEVICE_ID, fresh).apply()
+        return fresh
+    }
 
     fun load(): HandCamSettings {
         return HandCamSettings(
@@ -59,6 +95,8 @@ class HandCamPreferences(context: Context) {
             cameraControlEnabled = prefs.getBoolean(KEY_CAMERA_ENABLED, true),
             useFrontCamera = prefs.getBoolean(KEY_FRONT_CAMERA, true),
             showGestureBadge = prefs.getBoolean(KEY_GESTURE_BADGE, true),
+            pcSyncEnabled = prefs.getBoolean(KEY_PC_SYNC_ENABLED, false),
+            pcHubUrl = prefs.getString(KEY_PC_HUB_URL, "") ?: "",
         )
     }
 
@@ -72,11 +110,14 @@ class HandCamPreferences(context: Context) {
             .putBoolean(KEY_CAMERA_ENABLED, settings.cameraControlEnabled)
             .putBoolean(KEY_FRONT_CAMERA, settings.useFrontCamera)
             .putBoolean(KEY_GESTURE_BADGE, settings.showGestureBadge)
+            .putBoolean(KEY_PC_SYNC_ENABLED, settings.pcSyncEnabled)
+            .putString(KEY_PC_HUB_URL, settings.pcHubUrl.trim())
             .apply()
     }
 
     companion object {
         private const val PREFS_NAME = "shimeji_hand_cam_prefs"
+        private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_SCALE = "scale"
         private const val KEY_TILT_ENABLED = "tilt_enabled"
         private const val KEY_TILT_SENSITIVITY = "tilt_sensitivity"
@@ -85,5 +126,7 @@ class HandCamPreferences(context: Context) {
         private const val KEY_CAMERA_ENABLED = "camera_enabled"
         private const val KEY_FRONT_CAMERA = "front_camera"
         private const val KEY_GESTURE_BADGE = "gesture_badge"
+        private const val KEY_PC_SYNC_ENABLED = "pc_sync_enabled"
+        private const val KEY_PC_HUB_URL = "pc_hub_url"
     }
 }

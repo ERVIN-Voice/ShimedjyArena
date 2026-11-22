@@ -1,14 +1,22 @@
-"""Real-time 2D RGB hand detection, multi-gesture recognition, and confirmation-only
-handoff safety gate for non-depth cameras (PS3 Eye, standard webcams, Android RGB).
+"""High-precision real-time 2D RGB hand detection, multi-gesture recognition,
+and confirmation-only handoff safety gate for PC webcams, PS3 Eye, and Android RGB streams.
 
-Engineered specifically for low-quality / dim / noisy cameras (such as PS3 Eye)
-without confusing the user's face or torso with their hand:
-1. MediaPipeHandDetector (21-keypoint local neural hand landmarker loaded via
-   model_asset_buffer for full Windows path compatibility, VIDEO tracking mode +
-   low-light CLAHE/gamma enhancement) — never mistakes a face/body for a hand.
-2. OpenCVHandDetector (offline zero-download fallback) — denoised YCrCb+HSV skin
-   filter (no CLAHE wall-shift!), calibrated "Ignore Me + BG" subtraction,
-   motion-persistence scoring, torso/face rejection, and optional active hand ROI.
+Engineered for high accuracy on both HD webcams and noisy/low-light cameras (e.g. PS3 Eye):
+1. MediaPipeHandDetector (21-keypoint local neural hand landmarker):
+   - Loaded via model_asset_buffer (immune to Windows Unicode/space paths)
+   - Multi-hand primary-target lock (num_hands=2, stays locked on active hand)
+   - Smart adaptive low-light enhancement (only lifts dark/low-contrast frames)
+   - Dual-pass zoomed-ROI recovery if fast motion temporarily drops tracking
+   - Per-landmark One-Euro adaptive low-pass filtering (zero jitter still, zero lag fast)
+   - Rotation-, tilt-, and foreshortening-invariant joint-angle + radial finger analysis
+2. OpenCVHandDetector (offline zero-download fallback):
+   - Denoised YCrCb+HSV skin mask + pale-wall rejection + optional BG/skin calibration
+   - Distance-transform inscribed palm center + convexity-defect & radial-peak fingertip finder
+   - Motion-persistence & area-continuity scoring to ignore faces/torsos
+3. GestureRecognizer:
+   - Recognizes OPEN_PALM (RECEIVE_PET), PINCH, POINT, PEACE, and FIST
+   - FIST-before-PINCH disambiguation + PINCH hysteresis (no mid-drag drops!)
+   - One-Euro palm filter + smoothed velocity window + 1-frame flicker immunity
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ import os
 import time
 import urllib.request
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -53,6 +62,7 @@ HAND_CONNECTIONS: tuple[tuple[int, int], ...] = (
 )
 
 _CLAHE = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+_STRONG_CLAHE = cv2.createCLAHE(clipLimit=3.2, tileGridSize=(8, 8))
 _LAST_MEDIAPIPE_STATUS: str = ""
 
 
@@ -61,8 +71,12 @@ def get_last_mediapipe_status() -> str:
     return _LAST_MEDIAPIPE_STATUS
 
 
-def enhance_low_quality_frame(frame_bgr: np.ndarray) -> np.ndarray:
-    """Enhance dim, noisy, low-contrast frames for neural hand tracking (PS3 Eye indoors)."""
+def enhance_low_quality_frame(frame_bgr: np.ndarray, *, force: bool = True, strong: bool = False) -> np.ndarray:
+    """Enhance dim, noisy, low-contrast frames for neural hand tracking (PS3 Eye indoors).
+
+    When `force=False`, skips expensive enhancement if the frame is already bright
+    and well-contrasted so clean HD webcams remain razor-sharp without noise gain.
+    """
     if frame_bgr is None or frame_bgr.size == 0 or frame_bgr.ndim != 3:
         return frame_bgr
 
@@ -71,12 +85,16 @@ def enhance_low_quality_frame(frame_bgr: np.ndarray) -> np.ndarray:
     l_ch, a_ch, b_ch = cv2.split(lab)
 
     mean_l = float(np.mean(l_ch))
-    if mean_l < 95.0:
-        gamma = max(0.45, min(0.88, (mean_l + 25.0) / 130.0))
+    std_l = float(np.std(l_ch))
+    if not force and mean_l >= 112.0 and std_l >= 42.0:
+        return frame_bgr
+
+    if mean_l < 105.0:
+        gamma = max(0.45, min(0.88, (mean_l + 24.0) / 132.0))
         lut = np.array([min(255, int(((i / 255.0) ** gamma) * 255.0)) for i in range(256)], dtype=np.uint8)
         l_ch = cv2.LUT(l_ch, lut)
 
-    l_ch = _CLAHE.apply(l_ch)
+    l_ch = (_STRONG_CLAHE if strong else _CLAHE).apply(l_ch)
     enhanced_lab = cv2.merge((l_ch, a_ch, b_ch))
     return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
 
@@ -133,13 +151,90 @@ def ensure_mediapipe_model(
     return None
 
 
+class OneEuroFilter:
+    """Adaptive 1D One-Euro low-pass filter: rock-steady when still, zero lag when moving fast."""
+
+    def __init__(
+        self,
+        *,
+        min_cutoff: float = 1.4,
+        beta: float = 0.14,
+        d_cutoff: float = 1.0,
+    ) -> None:
+        self._min_cutoff = max(0.05, float(min_cutoff))
+        self._beta = max(0.0, float(beta))
+        self._d_cutoff = max(0.05, float(d_cutoff))
+        self._x_prev: float | None = None
+        self._dx_prev: float = 0.0
+        self._t_prev: float | None = None
+
+    @staticmethod
+    def _alpha(cutoff: float, dt: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * max(1e-4, cutoff))
+        return 1.0 / (1.0 + tau / max(1e-4, dt))
+
+    def reset(self) -> None:
+        self._x_prev = None
+        self._dx_prev = 0.0
+        self._t_prev = None
+
+    def filter(self, value: float, timestamp: float) -> float:
+        if self._x_prev is None or self._t_prev is None:
+            self._x_prev = value
+            self._dx_prev = 0.0
+            self._t_prev = timestamp
+            return value
+
+        dt = timestamp - self._t_prev
+        if dt <= 1e-5:
+            dt = 1.0 / 60.0
+        elif dt > 0.5:
+            # Long pause — snap cleanly rather than dragging stale velocity
+            self._x_prev = value
+            self._dx_prev = 0.0
+            self._t_prev = timestamp
+            return value
+
+        dx = (value - self._x_prev) / dt
+        a_d = self._alpha(self._d_cutoff, dt)
+        edx = a_d * dx + (1.0 - a_d) * self._dx_prev
+
+        cutoff = self._min_cutoff + self._beta * abs(edx)
+        a = self._alpha(cutoff, dt)
+        filtered = a * value + (1.0 - a) * self._x_prev
+
+        self._x_prev = filtered
+        self._dx_prev = edx
+        self._t_prev = timestamp
+        return filtered
+
+
+class OneEuroFilter2D:
+    """2D One-Euro adaptive filter for normalized hand coordinates."""
+
+    def __init__(self, *, min_cutoff: float = 1.4, beta: float = 0.16, d_cutoff: float = 1.0) -> None:
+        self._fx = OneEuroFilter(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff)
+        self._fy = OneEuroFilter(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff)
+
+    def reset(self) -> None:
+        self._fx.reset()
+        self._fy.reset()
+
+    def filter(self, pt: Point2D, timestamp: float) -> Point2D:
+        return Point2D(
+            x=min(1.0, max(0.0, self._fx.filter(pt.x, timestamp))),
+            y=min(1.0, max(0.0, self._fy.filter(pt.y, timestamp))),
+        )
+
+
 class GestureType(str, Enum):
     """Supported real-time hand gestures."""
 
     NONE = "none"
     PINCH = "pinch"              # Thumb + index pinched -> grab & drag pet
-    RECEIVE_PET = "receive_pet"  # Open palm (4-5 fingers) -> confirm incoming handoff / wake
+    RECEIVE_PET = "receive_pet"  # Open palm (4-5 fingers) -> confirm handoff / wave-pet / flick-jump / wake
     POINT = "point"              # Single raised index finger -> call pet toward hand X
+    PEACE = "peace"              # Index + middle raised (V-sign) -> celebrate with hearts!
     FIST = "fist"                # Closed fist -> sleep / calm pet
 
 
@@ -152,6 +247,18 @@ class Point2D:
 
     def distance_to(self, other: Point2D) -> float:
         return math.hypot(self.x - other.x, self.y - other.y)
+
+
+def _joint_angle_deg(a: Point2D, b: Point2D, c: Point2D) -> float:
+    """Return interior angle in degrees at vertex `b` formed by segments `b->a` and `b->c`."""
+    v1x, v1y = a.x - b.x, a.y - b.y
+    v2x, v2y = c.x - b.x, c.y - b.y
+    n1 = math.hypot(v1x, v1y)
+    n2 = math.hypot(v2x, v2y)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return 180.0
+    cos_val = max(-1.0, min(1.0, (v1x * v2x + v1y * v2y) / (n1 * n2)))
+    return math.degrees(math.acos(cos_val))
 
 
 @dataclass(frozen=True)
@@ -173,6 +280,10 @@ class HandDetectionResult:
     landmarks_21: tuple[Point2D, ...] = ()
     contour_norm: tuple[Point2D, ...] = ()
     mask_preview: np.ndarray | None = None
+    # Per-finger extension states: (thumb, index, middle, ring, pinky)
+    finger_states: tuple[bool, bool, bool, bool, bool] = (False, False, False, False, False)
+    avg_tip_ratio: float = 0.0
+    index_middle_spread: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -227,7 +338,9 @@ def analyze_21_landmarks(
     *,
     tracker_name: str = "mediapipe",
 ) -> HandDetectionResult:
-    """Extract normalized palm center, extended fingers, openness, and pinch ratio from 21 hand landmarks."""
+    """Extract rotation- & tilt-invariant palm center, per-finger curl/angles, openness,
+    pinch ratio, and finger spread from 21 hand landmarks.
+    """
     if len(points) != 21:
         return HandDetectionResult(detected=False, depth_available=False, tracker_name=tracker_name)
 
@@ -238,31 +351,78 @@ def analyze_21_landmarks(
     palm_y = sum(pts[i].y for i in mcp_indices) / len(mcp_indices)
     palm_center = Point2D(palm_x, palm_y)
 
-    palm_scale = max(0.03, wrist.distance_to(pts[9]))
+    # Dual-axis scale-invariant palm size (combines palm height & knuckle width
+    # so tilting the hand forward/backwards does not distort thresholds).
+    palm_len = wrist.distance_to(pts[9])
+    palm_width = pts[5].distance_to(pts[17])
+    palm_scale = max(0.03, 0.58 * palm_len + 0.42 * palm_width)
 
-    finger_pairs = ((8, 6), (12, 10), (16, 14), (20, 18))
+    # Analyze the 4 main fingers using BOTH joint angles (rotation-invariant!) AND radial ratio
+    finger_chains = (
+        (5, 6, 7, 8),     # Index
+        (9, 10, 11, 12),  # Middle
+        (13, 14, 15, 16), # Ring
+        (17, 18, 19, 20), # Pinky
+    )
     extended_tips: list[Point2D] = []
-    extended_count = 0
+    four_states: list[bool] = []
     extension_scores: list[float] = []
+    tip_ratios: list[float] = []
 
-    for tip_i, pip_i in finger_pairs:
-        tip_dist = wrist.distance_to(pts[tip_i])
-        pip_dist = wrist.distance_to(pts[pip_i])
-        ratio = tip_dist / max(0.01, pip_dist)
-        extension_scores.append(min(1.0, max(0.0, (ratio - 1.0) / 0.45)))
-        if ratio > 1.15 and tip_dist > palm_scale * 1.15:
-            extended_count += 1
+    for mcp_i, pip_i, dip_i, tip_i in finger_chains:
+        tip_wrist = wrist.distance_to(pts[tip_i])
+        pip_wrist = wrist.distance_to(pts[pip_i])
+        mcp_wrist = wrist.distance_to(pts[mcp_i])
+        tip_palm = palm_center.distance_to(pts[tip_i])
+        pip_palm = palm_center.distance_to(pts[pip_i])
+
+        radial_ratio = tip_wrist / max(0.01, pip_wrist)
+        palm_ratio = tip_palm / max(0.01, pip_palm)
+        pip_angle = _joint_angle_deg(pts[mcp_i], pts[pip_i], pts[tip_i])
+        dip_angle = _joint_angle_deg(pts[pip_i], pts[dip_i], pts[tip_i])
+
+        tip_ratios.append(tip_wrist / palm_scale)
+
+        # Continuous extension confidence [0..1]
+        radial_score = min(1.0, max(0.0, (radial_ratio - 0.98) / 0.42))
+        angle_score = min(1.0, max(0.0, (pip_angle - 105.0) / 65.0))
+        extension_scores.append(0.55 * radial_score + 0.45 * angle_score)
+
+        # Finger is extended when tip extends well past PIP AND joint is reasonably straight,
+        # OR when very straight at both PIP & DIP joints (handles foreshortened angles!).
+        is_ext = (
+            (radial_ratio > 1.12 and tip_wrist > palm_scale * 1.12 and pip_angle >= 122.0)
+            or (pip_angle >= 150.0 and dip_angle >= 145.0 and tip_wrist > mcp_wrist * 1.24 and palm_ratio > 1.05)
+        )
+        four_states.append(is_ext)
+        if is_ext:
             extended_tips.append(pts[tip_i])
 
+    # Thumb extension: lateral spread from pinky MCP + separation from index MCP + IP joint angle
     thumb_spread = pts[4].distance_to(pts[17])
     thumb_ip_spread = pts[3].distance_to(pts[17])
-    thumb_extended = thumb_spread > thumb_ip_spread * 1.08 and pts[4].distance_to(pts[5]) > palm_scale * 0.42
+    thumb_index_mcp_dist = pts[4].distance_to(pts[5])
+    thumb_angle = _joint_angle_deg(pts[2], pts[3], pts[4])
+    thumb_extended = (
+        thumb_spread > thumb_ip_spread * 1.07
+        and thumb_index_mcp_dist > palm_scale * 0.42
+        and thumb_angle >= 125.0
+    )
     if thumb_extended:
-        extended_count += 1
         extended_tips.append(pts[4])
 
-    thumb_index_dist = pts[4].distance_to(pts[8])
+    finger_states = (thumb_extended, four_states[0], four_states[1], four_states[2], four_states[3])
+    extended_count = sum(1 for flag in finger_states if flag)
+
+    # Pinch distance uses the closer of (thumb_tip <-> index_tip) and (thumb_tip <-> index_dip)
+    # normalized by palm_scale so slight finger-tip overlap registers crisply
+    thumb_index_dist = min(
+        pts[4].distance_to(pts[8]),
+        pts[4].distance_to(pts[7]) * 1.12,
+    )
     pinch_ratio = min(1.5, thumb_index_dist / palm_scale)
+    index_middle_spread = pts[8].distance_to(pts[12]) / palm_scale
+    avg_tip_ratio = sum(tip_ratios) / len(tip_ratios)
 
     xs = [p.x for p in pts]
     ys = [p.y for p in pts]
@@ -273,7 +433,7 @@ def analyze_21_landmarks(
 
     openness = min(
         1.0,
-        max(0.0, 0.65 * (extended_count / 5.0) + 0.35 * (sum(extension_scores) / len(extension_scores))),
+        max(0.0, 0.62 * (extended_count / 5.0) + 0.38 * (sum(extension_scores) / len(extension_scores))),
     )
     solidity = max(0.45, 0.96 - openness * 0.40)
 
@@ -291,24 +451,33 @@ def analyze_21_landmarks(
         depth_available=False,
         tracker_name=tracker_name,
         landmarks_21=pts,
+        finger_states=finger_states,
+        avg_tip_ratio=avg_tip_ratio,
+        index_middle_spread=index_middle_spread,
     )
 
 
 class MediaPipeHandDetector(HandDetector):
-    """Offline local 21-landmark neural hand detector using MediaPipe Tasks HandLandmarker.
+    """High-precision offline 21-landmark neural hand detector using MediaPipe Tasks.
 
-    Loads the model via `model_asset_buffer` (in-memory bytes) so Windows paths with
-    spaces, long directories, or Unicode characters NEVER fail in MediaPipe's C++ loader.
+    Key accuracy upgrades for real PC webcams & PS3 Eye:
+    - Loads model via `model_asset_buffer` (immune to Windows Unicode/space path issues).
+    - Tracks up to 2 hands internally and locks cleanly onto the primary hand closest
+      to the previous tracked palm (prevents background hands/reflections from hijacking).
+    - Smart adaptive low-light lift (only boosts dim/flat frames).
+    - Dual-pass zoomed-crop recovery around the last hand box if a frame drops tracking.
+    - Per-landmark One-Euro adaptive filter eliminates micro-jitter while preserving fast waves.
     """
 
     def __init__(
         self,
         model_path: str | Path = DEFAULT_MEDIAPIPE_MODEL_PATH,
         *,
-        min_detection_confidence: float = 0.35,
-        min_presence_confidence: float = 0.35,
-        min_tracking_confidence: float = 0.32,
+        min_detection_confidence: float = 0.42,
+        min_presence_confidence: float = 0.42,
+        min_tracking_confidence: float = 0.38,
         enhance_low_light: bool = True,
+        smooth_landmarks: bool = True,
     ) -> None:
         self._model_path = Path(model_path)
         if not self._model_path.exists():
@@ -324,21 +493,37 @@ class MediaPipeHandDetector(HandDetector):
 
         self._mp = mp
         self._enhance_low_light = enhance_low_light
+        self._smooth_landmarks = smooth_landmarks
         self._roi: tuple[float, float, float, float] | None = None
         self._last_ts_ms: int = 0
+        self._last_palm: Point2D | None = None
+        self._last_bbox: tuple[float, float, float, float] | None = None
+        self._miss_streak: int = 0
+        self._lm_filters: list[OneEuroFilter2D] = [
+            OneEuroFilter2D(min_cutoff=2.2, beta=0.28, d_cutoff=1.2) for _ in range(21)
+        ]
 
-        # Passing raw bytes avoids MediaPipe C++ fopen failures on Windows paths!
         model_bytes = self._model_path.read_bytes()
-        options = HandLandmarkerOptions(
+        video_options = HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_buffer=model_bytes),
             running_mode=RunningMode.VIDEO,
-            num_hands=1,
+            num_hands=2,
             min_hand_detection_confidence=min_detection_confidence,
             min_hand_presence_confidence=min_presence_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
-        self._landmarker = HandLandmarker.create_from_options(options)
-        logger.info("Initialized MediaPipeHandDetector (VIDEO mode, buffer=%d bytes)", len(model_bytes))
+        self._landmarker = HandLandmarker.create_from_options(video_options)
+
+        # Secondary IMAGE-mode detector for zoomed-crop recovery when fast motion drops VIDEO lock
+        recovery_options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_buffer=model_bytes),
+            running_mode=RunningMode.IMAGE,
+            num_hands=1,
+            min_hand_detection_confidence=max(0.28, min_detection_confidence - 0.12),
+            min_hand_presence_confidence=max(0.28, min_presence_confidence - 0.12),
+        )
+        self._recovery_landmarker = HandLandmarker.create_from_options(recovery_options)
+        logger.info("Initialized high-precision MediaPipeHandDetector (VIDEO+Recovery, buffer=%d bytes)", len(model_bytes))
 
     @property
     def name(self) -> str:
@@ -350,6 +535,64 @@ class MediaPipeHandDetector(HandDetector):
 
     def set_roi_norm(self, roi: tuple[float, float, float, float] | None) -> None:
         self._roi = roi
+        self._last_palm = None
+        self._last_bbox = None
+        self._reset_landmark_filters()
+
+    def clear_background(self) -> None:
+        self._last_palm = None
+        self._last_bbox = None
+        self._miss_streak = 0
+        self._reset_landmark_filters()
+
+    def _reset_landmark_filters(self) -> None:
+        for flt in self._lm_filters:
+            flt.reset()
+
+    def _select_best_hand(
+        self,
+        result: object,
+        rx0: int,
+        ry0: int,
+        rw: int,
+        rh: int,
+        w: int,
+        h: int,
+    ) -> tuple[list[Point2D], float] | None:
+        hand_landmarks = getattr(result, "hand_landmarks", None)
+        if not hand_landmarks:
+            return None
+
+        handedness = getattr(result, "handedness", None) or []
+        best_score = -1e9
+        best_pair: tuple[list[Point2D], float] | None = None
+
+        for idx, raw_lms in enumerate(hand_landmarks):
+            pts = [
+                Point2D(
+                    x=min(1.0, max(0.0, (rx0 + float(lm.x) * rw) / w)),
+                    y=min(1.0, max(0.0, (ry0 + float(lm.y) * rh) / h)),
+                )
+                for lm in raw_lms
+            ]
+            conf = 0.88
+            if idx < len(handedness) and handedness[idx]:
+                conf = float(handedness[idx][0].score)
+
+            palm_x = (pts[0].x + pts[5].x + pts[9].x + pts[13].x + pts[17].x) / 5.0
+            palm_y = (pts[0].y + pts[5].y + pts[9].y + pts[13].y + pts[17].y) / 5.0
+            palm_scale = math.hypot(pts[9].x - pts[0].x, pts[9].y - pts[0].y)
+
+            score = conf * 1.5 + min(0.5, palm_scale * 2.0)
+            if self._last_palm is not None:
+                dist = math.hypot(palm_x - self._last_palm.x, palm_y - self._last_palm.y)
+                score += max(0.0, 1.8 - dist * 3.2)
+
+            if score > best_score:
+                best_score = score
+                best_pair = (pts, conf)
+
+        return best_pair
 
     def detect(self, frame: CameraFrame) -> HandDetectionResult:
         bgr = frame.frame_bgr
@@ -369,7 +612,7 @@ class MediaPipeHandDetector(HandDetector):
             work_bgr = bgr
 
         if self._enhance_low_light:
-            work_bgr = enhance_low_quality_frame(work_bgr)
+            work_bgr = enhance_low_quality_frame(work_bgr, force=False)
 
         rgb = np.ascontiguousarray(cv2.cvtColor(work_bgr, cv2.COLOR_BGR2RGB))
         mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
@@ -379,37 +622,61 @@ class MediaPipeHandDetector(HandDetector):
             ts_ms = self._last_ts_ms + 1
         self._last_ts_ms = ts_ms
 
-        result = self._landmarker.detect_for_video(mp_image, ts_ms)
-        if not result.hand_landmarks:
-            return HandDetectionResult(detected=False, depth_available=False, tracker_name="mediapipe")
-
-        raw_lms = result.hand_landmarks[0]
         rw = max(1, rx1 - rx0)
         rh = max(1, ry1 - ry0)
-        points = [
-            Point2D(
-                x=(rx0 + float(lm.x) * rw) / w,
-                y=(ry0 + float(lm.y) * rh) / h,
-            )
-            for lm in raw_lms
-        ]
-        conf = 0.90
-        if result.handedness and result.handedness[0]:
-            conf = float(result.handedness[0][0].score)
-        return analyze_21_landmarks(points, confidence=conf, tracker_name="mediapipe")
+
+        result = self._landmarker.detect_for_video(mp_image, ts_ms)
+        picked = self._select_best_hand(result, rx0, ry0, rw, rh, w, h)
+
+        # Dual-pass recovery: if VIDEO tracker missed for 1..6 frames and we have a recent hand box,
+        # zoom in with strong contrast lift so small/fast-moving hands re-lock immediately!
+        if picked is None and self._last_bbox is not None and self._miss_streak < 6:
+            bx, by, bw_n, bh_n = self._last_bbox
+            pad_x = max(0.10, bw_n * 0.65)
+            pad_y = max(0.10, bh_n * 0.65)
+            cx0 = max(0, int((bx - pad_x) * w))
+            cy0 = max(0, int((by - pad_y) * h))
+            cx1 = min(w, int((bx + bw_n + pad_x) * w))
+            cy1 = min(h, int((by + bh_n + pad_y) * h))
+            if (cx1 - cx0) >= 48 and (cy1 - cy0) >= 48:
+                crop = enhance_low_quality_frame(bgr[cy0:cy1, cx0:cx1], force=True, strong=True)
+                crop_rgb = np.ascontiguousarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                crop_mp = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=crop_rgb)
+                rec_res = self._recovery_landmarker.detect(crop_mp)
+                picked = self._select_best_hand(rec_res, cx0, cy0, cx1 - cx0, cy1 - cy0, w, h)
+
+        if picked is None:
+            self._miss_streak += 1
+            if self._miss_streak >= 8:
+                self._last_palm = None
+                self._last_bbox = None
+                self._reset_landmark_filters()
+            return HandDetectionResult(detected=False, depth_available=False, tracker_name="mediapipe")
+
+        self._miss_streak = 0
+        points, conf = picked
+
+        if self._smooth_landmarks and len(points) == 21:
+            points = [self._lm_filters[i].filter(points[i], frame.timestamp) for i in range(21)]
+
+        analyzed = analyze_21_landmarks(points, confidence=conf, tracker_name="mediapipe")
+        self._last_palm = analyzed.palm_center
+        self._last_bbox = analyzed.bounding_box
+        return analyzed
 
     def close(self) -> None:
         if hasattr(self, "_landmarker") and self._landmarker is not None:
             self._landmarker.close()
             self._landmarker = None
+        if hasattr(self, "_recovery_landmarker") and self._recovery_landmarker is not None:
+            self._recovery_landmarker.close()
+            self._recovery_landmarker = None
 
 
 class OpenCVHandDetector(HandDetector):
     """Offline zero-download 2D RGB hand detector engineered to reject walls, sensor grain,
-    and stationary faces/torsos.
-
-    Notice: intentionally uses median-denoised RAW BGR (NOT CLAHE!) for color thresholding
-    so beige/warm walls do not get boosted into skin tones.
+    and stationary faces/torsos, upgraded with distance-transform palm centering and
+    radial fingertip peak analysis.
     """
 
     def __init__(
@@ -437,6 +704,7 @@ class OpenCVHandDetector(HandDetector):
         self._prev_gray: np.ndarray | None = None
         self._motion_memory: np.ndarray | None = None
         self._last_hand_center: Point2D | None = None
+        self._last_area_ratio: float | None = None
         self._roi: tuple[float, float, float, float] | None = None
         self._skin_calibrated: bool = False
 
@@ -455,6 +723,7 @@ class OpenCVHandDetector(HandDetector):
     def set_roi_norm(self, roi: tuple[float, float, float, float] | None) -> None:
         self._roi = roi
         self._last_hand_center = None
+        self._last_area_ratio = None
 
     @property
     def has_background_calibration(self) -> bool:
@@ -480,6 +749,7 @@ class OpenCVHandDetector(HandDetector):
         denoised = cv2.medianBlur(frame_bgr, 5)
         self._bg_reference_blur = cv2.GaussianBlur(denoised, (9, 9), 0)
         self._last_hand_center = None
+        self._last_area_ratio = None
         logger.info("Calibrated OpenCV background/user reference (%dx%d).", frame_bgr.shape[1], frame_bgr.shape[0])
         return True
 
@@ -525,6 +795,7 @@ class OpenCVHandDetector(HandDetector):
         self._motion_memory = None
         self._prev_gray = None
         self._last_hand_center = None
+        self._last_area_ratio = None
         self._skin_calibrated = False
         self._ycrcb_lower = np.array(DEFAULT_YCRCB_LOWER, dtype=np.uint8)
         self._ycrcb_upper = np.array(DEFAULT_YCRCB_UPPER, dtype=np.uint8)
@@ -596,7 +867,11 @@ class OpenCVHandDetector(HandDetector):
 
             if self._last_hand_center is not None:
                 dist = math.hypot(cx_norm - self._last_hand_center.x, cy_norm - self._last_hand_center.y)
-                score += max(0.0, 0.9 - dist * 2.0)
+                score += max(0.0, 1.1 - dist * 2.2)
+
+            if self._last_area_ratio is not None:
+                area_diff = abs(area_ratio - self._last_area_ratio) / max(0.02, self._last_area_ratio)
+                score += max(-0.4, 0.45 - area_diff * 0.5)
 
             candidates.append((score, cnt))
 
@@ -664,25 +939,42 @@ class OpenCVHandDetector(HandDetector):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             self._last_hand_center = None
+            self._last_area_ratio = None
             return HandDetectionResult(detected=False, depth_available=False, tracker_name="opencv_2d", mask_preview=mask)
 
         chosen = self._select_hand_contour(contours, w, h, motion_memory)
         if chosen is None:
             self._last_hand_center = None
+            self._last_area_ratio = None
             return HandDetectionResult(detected=False, depth_available=False, tracker_name="opencv_2d", mask_preview=mask)
 
         area = float(cv2.contourArea(chosen))
         area_ratio = area / frame_area
         bx, by, bw, bh = cv2.boundingRect(chosen)
-        moments = cv2.moments(chosen)
-        if moments["m00"] > 0:
-            cx = moments["m10"] / moments["m00"]
-            cy = moments["m01"] / moments["m00"]
+
+        # Inscribed palm circle via distanceTransform gives the true anatomical palm center
+        # (much steadier than raw contour centroid as fingers open/close!).
+        local_mask = np.zeros((bh + 2, bw + 2), dtype=np.uint8)
+        shifted = chosen - np.array([[[bx - 1, by - 1]]], dtype=chosen.dtype)
+        cv2.drawContours(local_mask, [shifted], -1, 255, thickness=-1)
+        dist_map = cv2.distanceTransform(local_mask, cv2.DIST_L2, 5)
+        _, max_radius, _, max_loc = cv2.minMaxLoc(dist_map)
+
+        if max_radius >= 6.0:
+            cx = float(bx - 1 + max_loc[0])
+            cy = float(by - 1 + max_loc[1])
         else:
-            cx = bx + bw / 2.0
-            cy = by + bh / 2.0
+            moments = cv2.moments(chosen)
+            if moments["m00"] > 0:
+                cx = moments["m10"] / moments["m00"]
+                cy = moments["m01"] / moments["m00"]
+            else:
+                cx = bx + bw / 2.0
+                cy = by + bh / 2.0
+            max_radius = max(8.0, min(bw, bh) * 0.25)
 
         self._last_hand_center = Point2D(cx / w, cy / h)
+        self._last_area_ratio = area_ratio
 
         hull_pts = cv2.convexHull(chosen, returnPoints=True)
         hull_area = float(cv2.contourArea(hull_pts))
@@ -721,8 +1013,15 @@ class OpenCVHandDetector(HandDetector):
                         tip_points.append((float(start[0]), float(start[1])))
                         tip_points.append((float(end[0]), float(end[1])))
 
+        # Also check hull vertices sticking out well above palm radius for clean 1- or 2-finger detection
+        min_tip_sep = max(10.0, bw * 0.14)
+        for pt_wrap in hull_pts:
+            hx, hy = float(pt_wrap[0][0]), float(pt_wrap[0][1])
+            dist_palm = math.hypot(hx - cx, hy - cy)
+            if dist_palm >= max_radius * 1.75 and hy < cy + max_radius * 0.35:
+                tip_points.append((hx, hy))
+
         dedup_tips: list[Point2D] = []
-        min_tip_sep = max(10.0, bw * 0.12)
         for tx, ty in tip_points:
             if all(math.hypot(tx - p.x * w, ty - p.y * h) > min_tip_sep for p in dedup_tips):
                 dedup_tips.append(Point2D(tx / w, ty / h))
@@ -756,8 +1055,12 @@ class OpenCVHandDetector(HandDetector):
         )
 
         pinch_ratio = min(1.0, max(0.0, top_span_ratio))
-        confidence = min(1.0, max(0.35, 0.5 + min(0.5, area_ratio * 4.0)))
+        index_middle_spread = 0.0
+        if len(dedup_tips) >= 2:
+            sorted_top = sorted(dedup_tips, key=lambda p: p.y)[:2]
+            index_middle_spread = sorted_top[0].distance_to(sorted_top[1]) / max(0.04, max_radius * 2.0 / max(1, w))
 
+        confidence = min(1.0, max(0.35, 0.5 + min(0.5, area_ratio * 4.0)))
         approx = cv2.approxPolyDP(chosen, epsilon=max(2.0, 0.008 * cv2.arcLength(chosen, True)), closed=True)
         contour_norm = tuple(Point2D(float(pt[0][0]) / w, float(pt[0][1]) / h) for pt in approx)
 
@@ -776,6 +1079,7 @@ class OpenCVHandDetector(HandDetector):
             tracker_name="opencv_2d",
             contour_norm=contour_norm,
             mask_preview=mask,
+            index_middle_spread=index_middle_spread,
         )
 
 
@@ -796,7 +1100,7 @@ def create_best_hand_detector(
         if candidate.exists():
             try:
                 det = MediaPipeHandDetector(model_path=candidate)
-                _LAST_MEDIAPIPE_STATUS = "Active (MediaPipe 21-pt AI)"
+                _LAST_MEDIAPIPE_STATUS = "Active (MediaPipe 21-pt AI + 1Euro)"
                 return det
             except Exception as exc:
                 _LAST_MEDIAPIPE_STATUS = f"MediaPipe init error: {exc}"
@@ -807,7 +1111,10 @@ def create_best_hand_detector(
 
 
 class GestureRecognizer:
-    """Temporal gesture classifier with EMA palm smoothing, velocity tracking, and dwell filtering."""
+    """High-precision temporal gesture classifier with One-Euro palm smoothing,
+    pinch hysteresis, FIST-before-PINCH disambiguation, smoothed velocity,
+    and 1-frame classification-flicker immunity.
+    """
 
     def __init__(
         self,
@@ -816,56 +1123,104 @@ class GestureRecognizer:
         hold_frames: int = 3,
         receive_openness_threshold: float = 0.62,
         receive_min_fingers: int = 4,
-        pinch_ratio_threshold: float = 0.38,
+        pinch_ratio_threshold: float = 0.40,
+        pinch_release_threshold: float = 0.52,
         smoothing_alpha: float = 0.45,
+        miss_tolerance: int = 1,
     ) -> None:
         self.detector = detector or OpenCVHandDetector()
         self._hold_frames = max(1, int(hold_frames))
         self._receive_openness_threshold = receive_openness_threshold
         self._receive_min_fingers = receive_min_fingers
         self._pinch_ratio_threshold = pinch_ratio_threshold
+        self._pinch_release_threshold = max(pinch_ratio_threshold + 0.08, pinch_release_threshold)
         self._smoothing_alpha = min(1.0, max(0.05, smoothing_alpha))
+        self._miss_tolerance = max(0, int(miss_tolerance))
 
         self._candidate_gesture: GestureType = GestureType.NONE
         self._streak: int = 0
+        self._active_gesture: GestureType = GestureType.NONE
+        self._active_conf: float = 0.0
+        self._active_miss_frames: int = 0
+
+        self._palm_filter = OneEuroFilter2D(min_cutoff=1.4, beta=0.18, d_cutoff=1.0)
         self._smoothed_palm: Point2D | None = None
         self._last_timestamp: float | None = None
+        self._vel_window: deque[tuple[float, float]] = deque(maxlen=3)
 
     def reset(self) -> None:
         self._candidate_gesture = GestureType.NONE
         self._streak = 0
+        self._active_gesture = GestureType.NONE
+        self._active_conf = 0.0
+        self._active_miss_frames = 0
+        self._palm_filter.reset()
         self._smoothed_palm = None
         self._last_timestamp = None
+        self._vel_window.clear()
 
-    def classify_hand(self, hand: HandDetectionResult) -> tuple[GestureType, float]:
+    def classify_hand(
+        self,
+        hand: HandDetectionResult,
+        *,
+        currently_pinching: bool = False,
+    ) -> tuple[GestureType, float]:
         if not hand.detected:
             return GestureType.NONE, 0.0
 
+        pinch_thresh = self._pinch_release_threshold if currently_pinching else self._pinch_ratio_threshold
+
+        # High-precision 21-landmark classification path (MediaPipe)
+        if hand.tracker_name == "mediapipe" and hand.landmarks_21:
+            thumb_ext, index_ext, middle_ext, ring_ext, pinky_ext = hand.finger_states
+            four_extended = int(index_ext) + int(middle_ext) + int(ring_ext) + int(pinky_ext)
+
+            # 1) CRITICAL: Classify FIST *before* PINCH so curled thumb+index never misfire PINCH!
+            if four_extended == 0 and (hand.avg_tip_ratio == 0.0 or hand.avg_tip_ratio < 1.44):
+                conf = min(1.0, 0.65 * hand.confidence + 0.35 * max(0.2, 1.0 - hand.openness_score))
+                return GestureType.FIST, conf
+
+            # 2) PINCH with hysteresis (tight enter, slightly wider hold so drags never drop!)
+            if hand.pinch_ratio <= pinch_thresh and not (four_extended == 4 and thumb_ext and hand.pinch_ratio > 0.34):
+                tightness = 1.0 - (hand.pinch_ratio / max(0.01, pinch_thresh))
+                conf = min(1.0, 0.58 * hand.confidence + 0.42 * max(0.28, tightness))
+                return GestureType.PINCH, conf
+
+            # 3) PEACE / VICTORY: index + middle clearly raised with V-spread, ring & pinky curled
+            if index_ext and middle_ext and not ring_ext and not pinky_ext and hand.index_middle_spread >= 0.16:
+                spread_bonus = min(0.25, hand.index_middle_spread * 0.35)
+                return GestureType.PEACE, min(1.0, 0.72 * hand.confidence + spread_bonus)
+
+            # 4) POINT: only index raised (thumb tucked or relaxed, not pinching)
+            if index_ext and not middle_ext and not ring_ext and not pinky_ext:
+                return GestureType.POINT, min(1.0, 0.72 * hand.confidence + 0.24)
+
+            # 5) OPEN PALM (RECEIVE_PET): 3+ main fingers extended and high openness
+            if (four_extended >= 3 or hand.extended_fingers >= self._receive_min_fingers) and hand.openness_score >= self._receive_openness_threshold:
+                conf = min(1.0, 0.52 * hand.confidence + 0.48 * hand.openness_score)
+                return GestureType.RECEIVE_PET, conf
+
+            return GestureType.NONE, 0.0
+
+        # OpenCV 2D fallback classification path
         if hand.extended_fingers >= self._receive_min_fingers and hand.openness_score >= self._receive_openness_threshold:
             conf = min(1.0, 0.5 * hand.confidence + 0.5 * hand.openness_score)
             return GestureType.RECEIVE_PET, conf
-
-        if hand.tracker_name == "mediapipe" and hand.landmarks_21:
-            if hand.extended_fingers == 0 and hand.openness_score < 0.15:
-                return GestureType.FIST, min(1.0, 0.65 * hand.confidence + 0.35 * (1.0 - hand.openness_score))
-            if hand.pinch_ratio <= self._pinch_ratio_threshold:
-                tightness = 1.0 - (hand.pinch_ratio / max(0.01, self._pinch_ratio_threshold))
-                conf = min(1.0, 0.55 * hand.confidence + 0.45 * max(0.25, tightness))
-                return GestureType.PINCH, conf
-            if hand.extended_fingers in (1, 2):
-                return GestureType.POINT, min(1.0, 0.70 * hand.confidence + 0.25)
-            return GestureType.NONE, 0.0
 
         if hand.extended_fingers == 0 and hand.solidity >= 0.88 and hand.aspect_ratio < 1.25:
             conf = min(1.0, 0.55 * hand.confidence + 0.45 * hand.solidity)
             return GestureType.FIST, conf
 
+        if hand.extended_fingers == 2 and hand.pinch_ratio > 0.42 and hand.index_middle_spread >= 0.45:
+            conf = min(1.0, 0.58 * hand.confidence + 0.32)
+            return GestureType.PEACE, conf
+
         if hand.extended_fingers == 1 and hand.aspect_ratio >= 2.0 and hand.pinch_ratio <= 0.32:
             conf = min(1.0, 0.55 * hand.confidence + 0.35)
             return GestureType.POINT, conf
 
-        if hand.extended_fingers <= 2 and hand.pinch_ratio <= self._pinch_ratio_threshold:
-            tightness = 1.0 - (hand.pinch_ratio / max(0.01, self._pinch_ratio_threshold))
+        if hand.extended_fingers <= 2 and hand.pinch_ratio <= pinch_thresh:
+            tightness = 1.0 - (hand.pinch_ratio / max(0.01, pinch_thresh))
             closedness = 1.0 - hand.openness_score
             conf = min(1.0, 0.45 * hand.confidence + 0.30 * closedness + 0.25 * max(0.2, tightness))
             return GestureType.PINCH, conf
@@ -874,33 +1229,67 @@ class GestureRecognizer:
 
     def process_frame(self, frame: CameraFrame) -> GestureEvent:
         hand = self.detector.detect(frame)
-        raw_gesture, raw_conf = self.classify_hand(hand)
+        raw_gesture, raw_conf = self.classify_hand(
+            hand,
+            currently_pinching=(self._active_gesture == GestureType.PINCH),
+        )
 
         vx, vy = 0.0, 0.0
         if hand.detected and hand.palm_center is not None:
-            if self._smoothed_palm is None:
-                self._smoothed_palm = hand.palm_center
-            else:
-                prev = self._smoothed_palm
-                a = self._smoothing_alpha
-                new_palm = Point2D(
-                    x=prev.x + (hand.palm_center.x - prev.x) * a,
-                    y=prev.y + (hand.palm_center.y - prev.y) * a,
-                )
-                if self._last_timestamp is not None:
-                    dt = frame.timestamp - self._last_timestamp
-                    if dt > 1e-4:
-                        vx = (new_palm.x - prev.x) / dt
-                        vy = (new_palm.y - prev.y) / dt
-                self._smoothed_palm = new_palm
+            prev = self._smoothed_palm
+            new_palm = self._palm_filter.filter(hand.palm_center, frame.timestamp)
+            if prev is not None and self._last_timestamp is not None:
+                dt = frame.timestamp - self._last_timestamp
+                if dt > 1e-4:
+                    inst_vx = (new_palm.x - prev.x) / dt
+                    inst_vy = (new_palm.y - prev.y) / dt
+                    self._vel_window.append((inst_vx, inst_vy))
+                    vx = sum(v[0] for v in self._vel_window) / len(self._vel_window)
+                    vy = sum(v[1] for v in self._vel_window) / len(self._vel_window)
+            self._smoothed_palm = new_palm
             self._last_timestamp = frame.timestamp
         else:
+            self._palm_filter.reset()
             self._smoothed_palm = None
             self._last_timestamp = None
+            self._vel_window.clear()
 
-        if raw_gesture == GestureType.NONE:
+        # Complete hand loss resets immediately
+        if not hand.detected:
             self._candidate_gesture = GestureType.NONE
             self._streak = 0
+            self._active_gesture = GestureType.NONE
+            self._active_conf = 0.0
+            self._active_miss_frames = 0
+            return GestureEvent(
+                GestureType.NONE,
+                0.0,
+                frame.timestamp,
+                hand,
+                smoothed_palm=None,
+                palm_vx=0.0,
+                palm_vy=0.0,
+            )
+
+        # Ambiguous single frame while hand is still visible: bridge up to `miss_tolerance` frames
+        # so momentary camera blur does not drop an active PINCH or FIST hold!
+        if raw_gesture == GestureType.NONE:
+            if self._active_gesture != GestureType.NONE and self._active_miss_frames < self._miss_tolerance:
+                self._active_miss_frames += 1
+                return GestureEvent(
+                    self._active_gesture,
+                    self._active_conf * 0.90,
+                    frame.timestamp,
+                    hand,
+                    smoothed_palm=self._smoothed_palm,
+                    palm_vx=vx,
+                    palm_vy=vy,
+                )
+            self._candidate_gesture = GestureType.NONE
+            self._streak = 0
+            self._active_gesture = GestureType.NONE
+            self._active_conf = 0.0
+            self._active_miss_frames = 0
             return GestureEvent(
                 GestureType.NONE,
                 0.0,
@@ -911,6 +1300,8 @@ class GestureRecognizer:
                 palm_vy=vy,
             )
 
+        self._active_miss_frames = 0
+
         if raw_gesture == self._candidate_gesture:
             self._streak += 1
         else:
@@ -918,6 +1309,8 @@ class GestureRecognizer:
             self._streak = 1
 
         if self._streak >= self._hold_frames:
+            self._active_gesture = raw_gesture
+            self._active_conf = raw_conf
             return GestureEvent(
                 raw_gesture,
                 raw_conf,
@@ -1013,8 +1406,11 @@ def draw_hand_overlay(
     show_mask: bool = False,
     handoff_armed: bool = False,
     roi_norm: tuple[float, float, float, float] | None = None,
+    pet_emotion: str = "",
 ) -> np.ndarray:
-    """Render real-time hand skeleton/contour, ROI box, palm crosshair, and gesture HUD onto a BGR frame."""
+    """Render real-time hand skeleton/contour, finger-state pills, pinch meter, palm crosshair,
+    and gesture HUD onto a BGR frame.
+    """
     hand = event.hand
     if show_mask and hand.mask_preview is not None:
         canvas = cv2.cvtColor(hand.mask_preview, cv2.COLOR_GRAY2BGR)
@@ -1044,6 +1440,9 @@ def draw_hand_overlay(
             for idx, pt in enumerate(px_pts):
                 color = (90, 255, 160) if idx in (4, 8, 12, 16, 20) else (255, 255, 255)
                 cv2.circle(canvas, pt, 4 if idx in (4, 8) else 3, color, -1)
+            # Highlight thumb-index pinch line
+            pinch_color = (90, 255, 160) if event.gesture == GestureType.PINCH else (180, 180, 200)
+            cv2.line(canvas, px_pts[4], px_pts[8], pinch_color, 2 if event.gesture == GestureType.PINCH else 1)
         elif hand.contour_norm:
             poly = np.array([[[int(p.x * w), int(p.y * h)]] for p in hand.contour_norm], dtype=np.int32)
             cv2.polylines(canvas, [poly], isClosed=True, color=(240, 200, 70), thickness=2)
@@ -1057,13 +1456,37 @@ def draw_hand_overlay(
             cv2.line(canvas, (px - 12, py), (px + 12, py), (86, 198, 224), 1)
             cv2.line(canvas, (px, py - 12), (px, py + 12), (86, 198, 224), 1)
 
-    cv2.rectangle(canvas, (0, 0), (w, 46), (20, 24, 36), -1)
-    gesture_label = event.gesture.value.upper()
-    tracker_tag = "AI-21pt" if hand.tracker_name == "mediapipe" else "OpenCV-2D"
-    header = f"{tracker_tag} | {fps:4.1f} FPS | Gesture: {gesture_label} ({int(event.confidence * 100)}%)"
-    cv2.putText(canvas, header, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 244, 255), 1, cv2.LINE_AA)
+        # Draw bottom-left finger extension pills (T I M R P) & pinch closeness bar
+        if hand.landmarks_21 and h >= 120:
+            labels = ("T", "I", "M", "R", "P")
+            base_y = h - 12
+            for idx, (lbl, is_up) in enumerate(zip(labels, hand.finger_states)):
+                px0 = 8 + idx * 24
+                bg = (68, 214, 130) if is_up else (48, 56, 74)
+                fg = (12, 18, 28) if is_up else (175, 190, 210)
+                cv2.rectangle(canvas, (px0, base_y - 18), (px0 + 20, base_y), bg, -1)
+                cv2.putText(canvas, lbl, (px0 + 5, base_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.42, fg, 1, cv2.LINE_AA)
 
-    status_text = active_action or ("ARMED: Show Open Palm to Receive Pet" if handoff_armed else "Pinch=Grab | Point=Call | Palm=Wake | Fist=Sleep")
+            # Pinch closeness bar
+            pinch_fill = max(0.0, min(1.0, 1.0 - (hand.pinch_ratio / 0.85)))
+            bar_x = 136
+            bar_w = 72
+            cv2.rectangle(canvas, (bar_x, base_y - 14), (bar_x + bar_w, base_y - 4), (42, 50, 68), -1)
+            fill_col = (80, 240, 145) if hand.pinch_ratio <= 0.42 else (86, 198, 224)
+            cv2.rectangle(canvas, (bar_x, base_y - 14), (bar_x + int(bar_w * pinch_fill), base_y - 4), fill_col, -1)
+
+    cv2.rectangle(canvas, (0, 0), (w, 48), (20, 24, 36), -1)
+    gesture_label = event.gesture.value.upper()
+    tracker_tag = "AI-21pt+1E" if hand.tracker_name == "mediapipe" else "OpenCV-2D"
+    emo_suffix = f" | {pet_emotion.upper()}" if pet_emotion else ""
+    header = f"{tracker_tag} | {fps:4.1f} FPS | {gesture_label} ({int(event.confidence * 100)}%){emo_suffix}"
+    cv2.putText(canvas, header, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (230, 244, 255), 1, cv2.LINE_AA)
+
+    status_text = active_action or (
+        "ARMED: Show Open Palm to Receive Pet"
+        if handoff_armed
+        else "Pinch=Grab | Point=Call | Palm=Pet/Jump | Peace=Love | Fist=Sleep"
+    )
     status_color = (114, 245, 166) if handoff_armed else (160, 215, 245)
-    cv2.putText(canvas, status_text, (8, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.42, status_color, 1, cv2.LINE_AA)
+    cv2.putText(canvas, status_text, (8, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.41, status_color, 1, cv2.LINE_AA)
     return canvas
