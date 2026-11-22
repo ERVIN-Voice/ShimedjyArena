@@ -3,13 +3,37 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+def _detect_project_root() -> Path:
+    """Return bundled read-only asset root (PyInstaller _MEIPASS when frozen, repo root otherwise)."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if getattr(sys, "frozen", False) and meipass:
+        return Path(meipass).resolve()
+    return Path(__file__).resolve().parent.parent
+
+
+def get_user_data_dir() -> Path:
+    """Return a writable directory for persisted state, QR PNGs, and logs."""
+    if getattr(sys, "frozen", False):
+        if sys.platform == "win32":
+            base = Path(os.environ.get("APPDATA") or Path.home())
+            data_dir = base / "GCS-Shimeji"
+        else:
+            data_dir = Path.home() / ".gcs-shimeji"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir
+    return Path.cwd()
+
+
+PROJECT_ROOT = _detect_project_root()
 DEFAULT_AVATAR_CONFIG_PATH = PROJECT_ROOT / "shared" / "avatar_config.json"
 DEFAULT_PROTOCOL_PATH = PROJECT_ROOT / "shared" / "protocol.json"
 

@@ -16,10 +16,10 @@ from typing import Any, Literal
 
 from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QPixmap
-from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMenu, QMessageBox, QSystemTrayIcon, QVBoxLayout
 
 from server.hub import build_pairing_uri, detect_local_ip, render_pairing_qr_ascii, save_pairing_qr_png
-from shared.config_loader import AvatarConfig, load_avatar_config, load_protocol_config
+from shared.config_loader import AvatarConfig, get_user_data_dir, load_avatar_config, load_protocol_config
 from windows.animations import AnimationController
 from windows.camera import CameraBackend, CameraFrame, PS3EyeCamera, ThreadedCameraReader, create_camera
 from windows.camera_preview import CameraPreviewWindow
@@ -134,6 +134,7 @@ class DesktopPetApp(QObject):
         self._window.request_pet_love.connect(self._pet_with_love)
         self._window.request_show_pairing.connect(self.show_pairing_dialog)
         self._window.request_toggle_camera_hud.connect(self.toggle_camera_preview)
+        self._window.request_enable_camera.connect(self._enable_camera_runtime)
         self._window.request_quit.connect(self.shutdown)
 
         # Incoming handoff prompt overlay
@@ -164,6 +165,8 @@ class DesktopPetApp(QObject):
         self._last_camera_frame: CameraFrame | None = None
         self._last_preview_draw: float = 0.0
         self._camera_preview: CameraPreviewWindow | None = None
+        self._hand_model_path: Path | None = hand_model_path
+        self._auto_download_hand_model: bool = auto_download_hand_model
 
         self._hand_detector = create_best_hand_detector(
             model_path=hand_model_path,
@@ -182,35 +185,7 @@ class DesktopPetApp(QObject):
         )
 
         if camera is not None:
-            reader = ThreadedCameraReader(camera, max_poll_hz=30.0)
-            if reader.start():
-                self._camera_reader = reader
-                cam_idx = getattr(camera, "device_index", 0)
-                self._camera_preview = CameraPreviewWindow(
-                    camera_kind=self._camera_kind,
-                    camera_index=cam_idx,
-                    tracker_name=self._hand_detector.name,
-                    tracker_note=get_last_mediapipe_status(),
-                )
-                self._camera_preview.request_calibrate_bg.connect(self._calibrate_camera_background)
-                self._camera_preview.request_calibrate_skin.connect(self._calibrate_camera_skin)
-                self._camera_preview.request_clear_bg.connect(self._clear_camera_background)
-                self._camera_preview.request_toggle_pause.connect(self._set_gestures_paused)
-                self._camera_preview.request_switch_camera_index.connect(self._switch_camera_index)
-                self._camera_preview.request_set_roi.connect(self._set_camera_roi)
-                if show_camera_preview:
-                    self._camera_preview.show()
-                logger.info(
-                    "Live gesture control active (camera=%s, tracker=%s, note=%s)",
-                    self._camera_kind,
-                    self._hand_detector.name,
-                    get_last_mediapipe_status(),
-                )
-            else:
-                logger.warning(
-                    "Could not open camera (%s). Try --list-cameras or --camera-index 1. Continuing without camera.",
-                    self._camera_kind,
-                )
+            self._attach_camera_backend(camera, show_preview=show_camera_preview)
 
         if not self.standalone:
             resolved_url = hub_url
@@ -278,6 +253,14 @@ class DesktopPetApp(QObject):
             cam_action = QAction("Show Camera & Gestures HUD", menu)
             cam_action.triggered.connect(self.toggle_camera_preview)
             menu.addAction(cam_action)
+        else:
+            cam_webcam = QAction("Enable Camera Gestures (Webcam)", menu)
+            cam_webcam.triggered.connect(lambda: self._enable_camera_runtime("webcam"))
+            menu.addAction(cam_webcam)
+
+            cam_ps3 = QAction("Enable Camera Gestures (PS3 Eye)", menu)
+            cam_ps3.triggered.connect(lambda: self._enable_camera_runtime("ps3_eye"))
+            menu.addAction(cam_ps3)
 
         menu.addSeparator()
         quit_action = QAction("Quit", menu)
@@ -287,6 +270,68 @@ class DesktopPetApp(QObject):
         tray.setContextMenu(menu)
         tray.show()
         return tray
+
+    def _attach_camera_backend(self, camera: CameraBackend, *, show_preview: bool = True) -> bool:
+        reader = ThreadedCameraReader(camera, max_poll_hz=30.0)
+        if not reader.start():
+            logger.warning(
+                "Could not open camera (%s). Try --list-cameras or --camera-index 1. Continuing without camera.",
+                camera.capabilities.device_kind,
+            )
+            return False
+
+        self._camera_reader = reader
+        self._camera_kind = camera.capabilities.device_kind
+        self._last_camera_seq = 0
+        cam_idx = getattr(camera, "device_index", 0)
+        self._camera_preview = CameraPreviewWindow(
+            camera_kind=self._camera_kind,
+            camera_index=cam_idx,
+            tracker_name=self._hand_detector.name,
+            tracker_note=get_last_mediapipe_status(),
+        )
+        self._camera_preview.request_calibrate_bg.connect(self._calibrate_camera_background)
+        self._camera_preview.request_calibrate_skin.connect(self._calibrate_camera_skin)
+        self._camera_preview.request_clear_bg.connect(self._clear_camera_background)
+        self._camera_preview.request_toggle_pause.connect(self._set_gestures_paused)
+        self._camera_preview.request_switch_camera_index.connect(self._switch_camera_index)
+        self._camera_preview.request_set_roi.connect(self._set_camera_roi)
+        if show_preview:
+            self._camera_preview.show()
+        logger.info(
+            "Live gesture control active (camera=%s, tracker=%s, note=%s)",
+            self._camera_kind,
+            self._hand_detector.name,
+            get_last_mediapipe_status(),
+        )
+        return True
+
+    def _enable_camera_runtime(self, kind: str) -> None:
+        if self._camera_preview is not None:
+            self._camera_preview.show()
+            self._camera_preview.raise_()
+            return
+        if kind not in ("webcam", "ps3_eye"):
+            return
+        # Ensure MediaPipe 21-pt detector is loaded if model exists or can be fetched
+        if self._hand_detector.name != "mediapipe_21pt":
+            upgraded = create_best_hand_detector(
+                model_path=self._hand_model_path,
+                auto_download_model=self._auto_download_hand_model,
+            )
+            if upgraded.name == "mediapipe_21pt":
+                self._hand_detector.close()
+                self._hand_detector = upgraded
+                self._gesture_recognizer.detector = upgraded
+
+        cam = create_camera(kind, device_index=0, ps3_mode=self._ps3_mode)  # type: ignore[arg-type]
+        if not self._attach_camera_backend(cam, show_preview=True):
+            QMessageBox.warning(
+                None,
+                "GCS Shimeji — Camera",
+                f"Could not open {kind} camera at index 0.\n"
+                "Make sure your webcam is plugged in and not used by another app.",
+            )
 
     def toggle_camera_preview(self) -> None:
         if self._camera_preview is None:
@@ -449,7 +494,7 @@ class DesktopPetApp(QObject):
             web_url = f"http://{lan_ip}:{web_port}"
             ws_url = f"ws://{lan_ip}:{self.hub_port}"
             uri = build_pairing_uri("0.0.0.0", self.hub_port, self.protocol, web_port=web_port)
-        qr_path = save_pairing_qr_png(web_url, Path("pairing_qr.png"))
+        qr_path = save_pairing_qr_png(web_url, get_user_data_dir() / "pairing_qr.png")
         dialog = PairingDialog(uri, web_url, qr_path, ws_url=ws_url)
         dialog.exec()
 

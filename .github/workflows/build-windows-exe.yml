@@ -1,0 +1,152 @@
+name: Build Windows Standalone EXE
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "windows/**"
+      - "server/**"
+      - "shared/**"
+      - "assets/**"
+      - "web/**"
+      - "build_exe/**"
+      - "requirements.txt"
+      - ".github/workflows/build-windows-exe.yml"
+  pull_request:
+    paths:
+      - "windows/**"
+      - "server/**"
+      - "shared/**"
+      - "assets/**"
+      - "web/**"
+      - "build_exe/**"
+      - "requirements.txt"
+      - ".github/workflows/build-windows-exe.yml"
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies and PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Run Python test suite on Windows
+        shell: pwsh
+        run: |
+          pytest -v *>&1 | Tee-Object -FilePath pytest_win.log
+          if ($LASTEXITCODE -ne 0) {
+            $err = (Get-Content pytest_win.log -Tail 30) -join " | "
+            if ($err.Length -gt 1200) { $err = $err.Substring($err.Length - 1200) }
+            Write-Output "::error title=Windows Pytest Failure::$err"
+            exit 1
+          }
+
+      - name: Download offline MediaPipe HandLandmarker model
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "assets\models" | Out-Null
+          $model = "assets\models\hand_landmarker.task"
+          $urls = @(
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+          )
+          $downloaded = $false
+          foreach ($url in $urls) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $model -UseBasicParsing
+              if ((Get-Item $model).Length -gt 1000000) {
+                $downloaded = $true
+                break
+              }
+            } catch {
+              Write-Warning "Failed to download from $url : $_"
+            }
+          }
+          if (-not $downloaded) {
+            Write-Output "::error title=Model Download Error::Could not download hand_landmarker.task"
+            exit 1
+          }
+          Get-Item $model | Select-Object Name, Length
+
+      - name: Generate Windows pixel-art icon
+        shell: pwsh
+        run: python build_exe\generate_icon.py
+
+      - name: Build standalone GCS-Shimeji-Windows.exe with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller --clean --noconfirm build_exe\gcs_shimeji.spec *>&1 | Tee-Object -FilePath pyinstaller_build.log
+          if ($LASTEXITCODE -ne 0) {
+            $err = (Get-Content pyinstaller_build.log -Tail 30) -join " | "
+            if ($err.Length -gt 1200) { $err = $err.Substring($err.Length - 1200) }
+            Write-Output "::error title=PyInstaller Build Failure::$err"
+            exit 1
+          }
+          $exe = Get-Item "dist\GCS-Shimeji-Windows.exe"
+          Write-Host ("Built {0} ({1:N1} MB)" -f $exe.FullName, ($exe.Length / 1MB))
+
+      - name: Smoke-test frozen GCS-Shimeji-Windows.exe (--self-test)
+        shell: pwsh
+        run: |
+          $logFile = Join-Path $PWD "self_test_output.txt"
+          if (Test-Path $logFile) { Remove-Item $logFile -Force }
+          $proc = Start-Process -FilePath "dist\GCS-Shimeji-Windows.exe" `
+            -ArgumentList "--self-test", "--self-test-log", $logFile `
+            -Wait -PassThru
+          if ($proc.ExitCode -ne 0 -or -not (Test-Path $logFile)) {
+            $errLog = Join-Path $env:APPDATA "GCS-Shimeji\gcs_shimeji_error.log"
+            $details = "ExitCode=$($proc.ExitCode)"
+            if (Test-Path $errLog) {
+              $details += " | " + ((Get-Content $errLog -Tail 25) -join " ")
+            }
+            if ($details.Length -gt 1200) { $details = $details.Substring(0, 1200) }
+            Write-Output "::error title=EXE Self-Test Failed::$details"
+            exit 1
+          }
+          Get-Content $logFile
+
+      - name: Upload GCS-Shimeji-Windows.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GCS-Shimeji-Windows-EXE
+          path: dist/GCS-Shimeji-Windows.exe
+          if-no-files-found: error
+
+      - name: Publish direct-download EXE to GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $exe = "dist\GCS-Shimeji-Windows.exe"
+          $tag = "windows-exe-latest"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $exe --clobber
+          } else {
+            gh release create $tag $exe `
+              --target "$env:GITHUB_SHA" `
+              --prerelease `
+              --title "GCS Shimeji — Windows Standalone Desktop Pet + Hub + Hand Cam (.exe)" `
+              --notes "Standalone Windows .exe (no Python required): transparent desktop Shimeji pet, embedded GCS Local Hub (WebSocket + mDNS + QR pairing for Android Hand Cam & Web), 8 unified pixel-art emotions, and built-in offline MediaPipe 21-point hand tracking (enable Webcam or PS3 Eye right from the right-click or system tray menu)."
+          }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error title=Release Upload Failed::gh release command exited with $LASTEXITCODE"
+            exit 1
+          }

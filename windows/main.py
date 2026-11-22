@@ -6,9 +6,10 @@ import argparse
 import logging
 import signal
 import sys
+import traceback
 from pathlib import Path
 
-from shared.config_loader import load_avatar_config
+from shared.config_loader import PROJECT_ROOT, get_user_data_dir, load_avatar_config, load_protocol_config
 from windows.camera import CameraBackend, create_camera, probe_cameras
 
 
@@ -90,12 +91,59 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Probe available camera indices and exit",
     )
     parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Verify bundled assets, MediaPipe model, protocol, and GUI imports, then exit 0",
+    )
+    parser.add_argument(
+        "--self-test-log",
+        type=Path,
+        default=None,
+        help="Optional file path to write self-test summary (useful for windowed Windows .exe)",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
         help="Logging verbosity",
     )
     return parser.parse_args(argv)
+
+
+def _run_self_test(log_path: Path | None = None) -> int:
+    """Smoke-test bundled assets and runtime dependencies (used to verify PyInstaller .exe builds)."""
+    cfg = load_avatar_config()
+    proto = load_protocol_config()
+    assert cfg.visual.sprite_sheet.exists(), f"Missing spritesheet: {cfg.visual.sprite_sheet}"
+    web_index = PROJECT_ROOT / "web" / "index.html"
+    assert web_index.exists(), f"Missing web client asset: {web_index}"
+    assert "love" in proto.emotions, "Unified emotions missing from protocol"
+
+    import cv2  # noqa: F401
+    import websockets  # noqa: F401
+    from PySide6.QtWidgets import QApplication  # noqa: F401
+    from server.hub import GCSLocalHub  # noqa: F401
+    from windows.hand_detection import DEFAULT_MEDIAPIPE_MODEL_PATH, create_best_hand_detector
+
+    assert DEFAULT_MEDIAPIPE_MODEL_PATH.exists(), f"Missing bundled hand_landmarker.task at {DEFAULT_MEDIAPIPE_MODEL_PATH}"
+    det = create_best_hand_detector(prefer_mediapipe=True, auto_download_model=False)
+    try:
+        assert det.name == "mediapipe_21pt", f"Expected mediapipe_21pt detector, got {det.name}"
+    finally:
+        det.close()
+
+    summary = (
+        f"SELF-TEST OK | frozen={getattr(sys, 'frozen', False)} | "
+        f"root={PROJECT_ROOT} | model={DEFAULT_MEDIAPIPE_MODEL_PATH.name} | tracker={det.name}"
+    )
+    try:
+        print(summary)
+    except Exception:
+        pass
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(summary + "\n", encoding="utf-8")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -105,6 +153,17 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+    if args.self_test:
+        try:
+            return _run_self_test(log_path=args.self_test_log)
+        except Exception:
+            tb = traceback.format_exc()
+            try:
+                (get_user_data_dir() / "gcs_shimeji_error.log").write_text(tb, encoding="utf-8")
+            except Exception:
+                pass
+            raise
+
     if args.list_cameras:
         found = probe_cameras(max_index=6)
         if found:
@@ -113,40 +172,62 @@ def main(argv: list[str] | None = None) -> int:
             print("No working cameras detected on indices 0..5.")
         return 0
 
-    from PySide6.QtWidgets import QApplication
-    from windows.desktop_pet import DesktopPetApp
+    try:
+        from PySide6.QtWidgets import QApplication
+        from windows.desktop_pet import DesktopPetApp
 
-    avatar_cfg = load_avatar_config(args.config)
-    camera: CameraBackend | None = None
-    if args.camera != "none":
-        camera = create_camera(
-            args.camera,
-            device_index=args.camera_index,
-            ps3_mode=args.ps3_mode,
+        avatar_cfg = load_avatar_config(args.config)
+        camera: CameraBackend | None = None
+        if args.camera != "none":
+            camera = create_camera(
+                args.camera,
+                device_index=args.camera_index,
+                ps3_mode=args.ps3_mode,
+            )
+
+        qt_app = QApplication(sys.argv)
+        qt_app.setQuitOnLastWindowClosed(False)
+
+        pet_app = DesktopPetApp(
+            qt_app,
+            avatar_config=avatar_cfg,
+            scale=args.scale,
+            standalone=args.standalone,
+            hub_url=args.hub_url,
+            hub_port=args.port,
+            enable_mdns=not args.no_mdns,
+            camera=camera,
+            show_camera_preview=not args.no_camera_preview,
+            hand_model_path=args.hand_model,
+            auto_download_hand_model=not args.offline,
         )
 
-    qt_app = QApplication(sys.argv)
-    qt_app.setQuitOnLastWindowClosed(False)
+        def _handle_sigint(*_args: object) -> None:
+            pet_app.shutdown()
 
-    pet_app = DesktopPetApp(
-        qt_app,
-        avatar_config=avatar_cfg,
-        scale=args.scale,
-        standalone=args.standalone,
-        hub_url=args.hub_url,
-        hub_port=args.port,
-        enable_mdns=not args.no_mdns,
-        camera=camera,
-        show_camera_preview=not args.no_camera_preview,
-        hand_model_path=args.hand_model,
-        auto_download_hand_model=not args.offline,
-    )
+        signal.signal(signal.SIGINT, _handle_sigint)
+        return qt_app.exec()
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logging.getLogger(__name__).critical("Fatal startup error:\n%s", tb)
+        log_path: Path | None = None
+        try:
+            log_path = get_user_data_dir() / "gcs_shimeji_error.log"
+            log_path.write_text(tb, encoding="utf-8")
+        except Exception:
+            pass
+        if getattr(sys, "frozen", False):
+            try:
+                from PySide6.QtWidgets import QApplication, QMessageBox
 
-    def _handle_sigint(*_args: object) -> None:
-        pet_app.shutdown()
-
-    signal.signal(signal.SIGINT, _handle_sigint)
-    return qt_app.exec()
+                app = QApplication.instance() or QApplication(sys.argv)
+                msg = f"GCS Shimeji encountered an error:\n\n{exc}"
+                if log_path is not None:
+                    msg += f"\n\nFull error log saved to:\n{log_path}"
+                QMessageBox.critical(None, "GCS Shimeji — Startup Error", msg)
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":

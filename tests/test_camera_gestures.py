@@ -250,9 +250,18 @@ def test_mediapipe_21_landmark_geometry_classifier() -> None:
 
 
 def test_gesture_pet_controller_real_time_interactions(tmp_path: Path) -> None:
+    import random
+
     cfg = load_avatar_config()
     bounds = DesktopBounds([ScreenRect(0, 0, 1280, 720, is_primary=True)])
-    engine = PetEngine(cfg, bounds, pet_width=128, pet_height=128, state_file=tmp_path / "state.json")
+    engine = PetEngine(
+        cfg,
+        bounds,
+        pet_width=128,
+        pet_height=128,
+        state_file=tmp_path / "state.json",
+        rng=random.Random(42),
+    )
 
     cam = SyntheticCamera(width=320, height=240)
     recognizer = GestureRecognizer(detector=OpenCVHandDetector(), hold_frames=2)
