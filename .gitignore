@@ -15,7 +15,7 @@ build/
 # Runtime state & generated pairing artifacts
 .gcs_shimeji_state.json
 pairing_qr.png
-assets/models/*.task
+*.task
 logs/
 *.log
 
@@ -25,6 +25,16 @@ android/build/
 android/app/build/
 android/local.properties
 android/.idea/
+android-standalone/.gradle/
+android-standalone/build/
+android-standalone/app/build/
+android-standalone/local.properties
+android-standalone/.idea/
+android-standalone-camera/.gradle/
+android-standalone-camera/build/
+android-standalone-camera/app/build/
+android-standalone-camera/local.properties
+android-standalone-camera/.idea/
 *.iml
 *.apk
 *.aab

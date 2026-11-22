@@ -1,0 +1,83 @@
+name: Build Android HandCam Overlay APK
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "android-standalone-camera/**"
+      - ".github/workflows/build-handcam-android-apk.yml"
+  pull_request:
+    paths:
+      - "android-standalone-camera/**"
+      - ".github/workflows/build-handcam-android-apk.yml"
+  workflow_dispatch:
+
+jobs:
+  build-handcam-apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: android-standalone-camera
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download offline MediaPipe HandLandmarker model into APK assets
+        run: |
+          MODEL="app/src/main/assets/hand_landmarker.task"
+          curl -fSL \
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task" \
+            -o "$MODEL" || \
+          curl -fSL \
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" \
+            -o "$MODEL"
+          ls -lh "$MODEL"
+          test -s "$MODEL"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Run HandCam unit tests & build Debug APK
+        run: |
+          set -o pipefail
+          if ! gradle testDebugUnitTest assembleDebug --stacktrace 2>&1 | tee gradle_build.log; then
+            ERR_SUMMARY=$(grep -E "(e: |FAILED|AssertionError|Exception|FAILURE:)" gradle_build.log | tail -n 25 | tr '\n' ' ' | cut -c1-1200)
+            echo "::error title=Gradle Build Error::$ERR_SUMMARY"
+            exit 1
+          fi
+          cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/Shimeji-HandCam.apk
+
+      - name: Upload Shimeji-HandCam.apk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shimeji-HandCam-APK
+          path: android-standalone-camera/app/build/outputs/apk/debug/Shimeji-HandCam.apk
+          if-no-files-found: error
+
+      - name: Publish direct-download APK to GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APK="app/build/outputs/apk/debug/Shimeji-HandCam.apk"
+          TAG="android-handcam-latest"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "Shimeji Hand Cam — Overlay + Camera + Emotions (Android APK)" \
+              --notes "Отдельное Android-приложение: чубрик поверх экрана + смешные падения при повороте + 8 пиксельных эмоций + оффлайн-управление ладонью через камеру (MediaPipe 21 точка). Скачайте и установите Shimeji-HandCam.apk прямо на телефон."
+          fi
