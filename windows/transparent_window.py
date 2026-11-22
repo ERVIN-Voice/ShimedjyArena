@@ -99,6 +99,7 @@ class TransparentPetWindow(QWidget):
     request_scale_delta = Signal(int)
     request_toggle_sleep = Signal()
     request_pet_love = Signal()
+    request_set_emotion = Signal(str)
     request_show_pairing = Signal()
     request_toggle_camera_hud = Signal()
     request_enable_camera = Signal(str)  # "webcam" | "ps3_eye"
@@ -309,6 +310,21 @@ class TransparentPetWindow(QWidget):
         love_action = QAction("Pet with Love ♥", menu)
         love_action.triggered.connect(self.request_pet_love.emit)
         menu.addAction(love_action)
+
+        emo_menu = menu.addMenu("Emotion & Color")
+        for emo_id, emo_label in (
+            ("neutral", "Neutral (Cyan)"),
+            ("happy", "Happy (Gold Yellow)"),
+            ("love", "Love (Pink ♥)"),
+            ("excited", "Excited (Mint Green)"),
+            ("scared", "Scared (Ice Indigo)"),
+            ("dizzy", "Dizzy (Purple)"),
+            ("angry", "Angry (Crimson Red)"),
+            ("sleepy", "Sleepy (Lavender Zzz)"),
+        ):
+            act = QAction(emo_label, emo_menu)
+            act.triggered.connect(lambda _checked=False, e=emo_id: self.request_set_emotion.emit(e))
+            emo_menu.addAction(act)
 
         sleep_label = "Wake Up" if self._is_sleeping else "Sleep"
         sleep_action = QAction(sleep_label, menu)

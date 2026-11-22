@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 from dataclasses import dataclass
@@ -198,6 +199,8 @@ class PetEngine:
         self._dragging: bool = False
         self._drag_target_x: float = self.x
         self._drag_target_y: float = self.y
+        self._drag_vx: float = 0.0
+        self._drag_vy: float = 0.0
         self._edge_dwell_edge: str | None = None
         self._edge_dwell_seconds: float = 0.0
         self._edge_handoff_fired: bool = False
@@ -281,6 +284,8 @@ class PetEngine:
         self._airborne = False
         self.vx = 0.0
         self.vy = 0.0
+        self._drag_vx = 0.0
+        self._drag_vy = 0.0
         self.state = "DRAGGING"
         self.animation = "grab"
         self._idle_elapsed = 0.0
@@ -301,11 +306,59 @@ class PetEngine:
         self._drag_target_x = cx
         self._drag_target_y = cy
 
+    def _detect_fling_edge(self) -> tuple[str | None, float]:
+        """Detect a deliberate fast throw toward an outer desktop edge."""
+        cx = self.x + self.pet_width / 2.0
+        cy = self.y + self.pet_height / 2.0
+        screen = self.bounds.screen_for_point(cx, cy)
+        norm_y = min(1.0, max(0.0, (cy - screen.top) / max(1.0, float(screen.height))))
+
+        has_left = any(s is not screen and s.right <= screen.left + 4 and s.top <= cy <= s.bottom for s in self.bounds.screens)
+        has_right = any(s is not screen and s.left >= screen.right - 4 and s.top <= cy <= s.bottom for s in self.bounds.screens)
+        has_top = any(s is not screen and s.bottom <= screen.top + 4 and s.left <= cx <= s.right for s in self.bounds.screens)
+
+        fling_vx = 650.0
+        fling_vy = 650.0
+        if not has_left and self._drag_vx <= -fling_vx and self.x <= screen.left + screen.width * 0.28:
+            return "left", norm_y
+        if not has_right and self._drag_vx >= fling_vx and (self.x + self.pet_width) >= screen.right - screen.width * 0.28:
+            return "right", norm_y
+        if not has_top and self._drag_vy <= -fling_vy and self.y <= screen.top + screen.height * 0.25:
+            return "top", norm_y
+        return None, norm_y
+
     def end_drag(self) -> None:
-        """Release the pet; if airborne, let gravity bring it down to the monitor floor."""
+        """Release the pet; support fling-to-edge handoff or let gravity bring it down."""
         if not self._dragging:
             return
+
+        # Check whether the user threw the pet toward an outer edge or released right against the edge
+        if not self._edge_handoff_fired and self._on_edge_handoff is not None:
+            beh = self.config.behavior
+            near_edge, norm_y = self.bounds.detect_outer_edge(
+                self.x,
+                self.y,
+                self.pet_width,
+                self.pet_height,
+                max(beh.edge_handoff_margin_px * 2, 28),
+            )
+            fling_edge, fling_ny = self._detect_fling_edge()
+            chosen_edge: str | None = None
+            chosen_ny = norm_y
+            if fling_edge is not None:
+                chosen_edge, chosen_ny = fling_edge, fling_ny
+            elif near_edge is not None and self._edge_dwell_seconds >= 0.12:
+                chosen_edge, chosen_ny = near_edge, norm_y
+
+            if chosen_edge is not None:
+                self._edge_handoff_fired = True
+                self._on_edge_handoff(
+                    EdgeHandoffEvent(edge=chosen_edge, normalized_y=chosen_ny, x=self.x, y=self.y)
+                )
+
         self._dragging = False
+        self._drag_vx = 0.0
+        self._drag_vy = 0.0
         self._edge_dwell_edge = None
         self._edge_dwell_seconds = 0.0
         self._edge_handoff_fired = False
@@ -499,9 +552,17 @@ class PetEngine:
 
         if self._dragging:
             # Smooth exponential follow for natural feel
+            prev_x, prev_y = self.x, self.y
             alpha = 1.0 - pow(1.0 - beh.smooth_follow_factor, dt * 60.0)
             self.x += (self._drag_target_x - self.x) * alpha
             self.y += (self._drag_target_y - self.y) * alpha
+            inst_vx = (self.x - prev_x) / max(1e-4, dt)
+            inst_vy = (self.y - prev_y) / max(1e-4, dt)
+            self._drag_vx = self._drag_vx * 0.55 + inst_vx * 0.45
+            self._drag_vy = self._drag_vy * 0.55 + inst_vy * 0.45
+
+            if math.hypot(self._drag_vx, self._drag_vy) > 1350.0 and self.emotion not in ("love", "angry"):
+                self.set_emotion("scared", duration_seconds=2.0)
 
             edge, norm_y = self.bounds.detect_outer_edge(
                 self.x, self.y, self.pet_width, self.pet_height, beh.edge_handoff_margin_px

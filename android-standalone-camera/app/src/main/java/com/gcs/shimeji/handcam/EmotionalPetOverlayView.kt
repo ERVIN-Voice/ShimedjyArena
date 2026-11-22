@@ -140,7 +140,7 @@ class EmotionalPetOverlayView(
         canvas.scale(flipX * physics.scaleX, physics.scaleY)
         val half = petSize * 0.5f
         dstRect.set(-half, -half, half, half)
-        canvas.drawBitmap(spriteSheet.bitmap, srcRect, dstRect, spritePaint)
+        canvas.drawBitmap(spriteSheet.bitmapForEmotion(physics.emotion), srcRect, dstRect, spritePaint)
 
         // Rosy pixel blush cheeks for LOVE & HAPPY emotions
         if (physics.emotion == PetEmotion.LOVE || physics.emotion == PetEmotion.HAPPY) {

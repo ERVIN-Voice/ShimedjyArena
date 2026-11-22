@@ -600,4 +600,31 @@ def test_pc_peace_and_wave_drive_unified_love_emotion(tmp_path: Path) -> None:
     assert engine.emotion == "love"
 
 
+def test_camera_640x480_active_zone_reaches_full_desktop_edges(tmp_path: Path) -> None:
+    """With a 640x480 webcam, hands stay comfortably inside [0.22..0.78] yet reach 100% of desktop edges."""
+    import pytest
+
+    cfg = load_avatar_config()
+    bounds = DesktopBounds([ScreenRect(0, 0, 1920, 1080, is_primary=True)])
+    engine = PetEngine(cfg, bounds, pet_width=128, pet_height=128, state_file=tmp_path / "cam640.json")
+    rec = GestureRecognizer(detector=OpenCVHandDetector(), hold_frames=1)
+    gate = HandoffGestureConfirmationController(recognizer=rec)
+    ctrl = GesturePetController(engine, rec, gate)
+
+    # Left comfortable edge of 640x480 frame -> exact desktop left edge (x == 0)
+    lx, ly = ctrl.map_hand_to_desktop(Point2D(0.22, 0.18))
+    assert lx == pytest.approx(0.0, abs=0.5)
+    assert ly == pytest.approx(0.0, abs=0.5)
+
+    # Right comfortable edge of 640x480 frame -> exact desktop right edge (x == 1920 - 128)
+    rx, ry = ctrl.map_hand_to_desktop(Point2D(0.78, 0.82))
+    assert rx == pytest.approx(1920.0 - 128.0, abs=0.5)
+    assert ry == pytest.approx(1080.0 - 128.0, abs=0.5)
+
+    # Reaching the right edge with hand at 0.78 triggers outer edge detection for handoff!
+    edge, _ = bounds.detect_outer_edge(rx, 400.0, 128, 128, margin_px=14)
+    assert edge == "right"
+
+
+
 

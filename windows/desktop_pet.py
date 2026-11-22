@@ -132,6 +132,7 @@ class DesktopPetApp(QObject):
         self._window.request_scale_delta.connect(self._adjust_scale)
         self._window.request_toggle_sleep.connect(self._toggle_sleep)
         self._window.request_pet_love.connect(self._pet_with_love)
+        self._window.request_set_emotion.connect(self._set_manual_emotion)
         self._window.request_show_pairing.connect(self.show_pairing_dialog)
         self._window.request_toggle_camera_hud.connect(self.toggle_camera_preview)
         self._window.request_enable_camera.connect(self._enable_camera_runtime)
@@ -426,6 +427,7 @@ class DesktopPetApp(QObject):
             logger.debug("Edge reached (%s) but no peer device is connected.", event.edge)
             return
         logger.info("Edge drag triggered Windows -> Peer handoff (edge=%s, y=%.2f)", event.edge, event.normalized_y)
+        self._push_state_to_hub(force=True)
         self._engine.enter_handoff_pending()
         self._ws_client.send_handoff_request(edge=event.edge, normalized_y=event.normalized_y)
 
@@ -434,6 +436,7 @@ class DesktopPetApp(QObject):
             return
         if not self._engine.is_owner or not self._has_online_peer():
             return
+        self._push_state_to_hub(force=True)
         self._engine.enter_handoff_pending()
         self._ws_client.send_handoff_request(edge="right", normalized_y=0.5)
 
@@ -481,6 +484,11 @@ class DesktopPetApp(QObject):
 
     def _pet_with_love(self) -> None:
         self._engine.pet_with_love()
+        self._push_state_to_hub(force=True)
+
+    def _set_manual_emotion(self, emotion: str) -> None:
+        dur = 0.0 if emotion == "neutral" else 8.0
+        self._engine.set_emotion(emotion, duration_seconds=dur)
         self._push_state_to_hub(force=True)
 
     def show_pairing_dialog(self) -> None:
@@ -531,6 +539,7 @@ class DesktopPetApp(QObject):
                         show_mask=self._camera_preview.show_mask,
                         handoff_armed=(self._gesture_confirm.pending_handoff_id is not None),
                         roi_norm=self._hand_detector.roi_norm,
+                        control_zone_norm=self._gesture_controller.control_zone_norm,
                         pet_emotion=self._engine.emotion,
                     )
                     self._camera_preview.update_frame(annotated, status_text=update.active_action)
@@ -538,6 +547,7 @@ class DesktopPetApp(QObject):
         # Advance physics & animations
         self._engine.tick(dt)
         self._anim.facing = self._engine.facing
+        self._anim.emotion = self._engine.emotion
         self._anim.play(self._engine.animation)
         self._anim.update(dt)
 
@@ -615,7 +625,8 @@ class DesktopPetApp(QObject):
             source_name = str(payload.get("source_device_name") or payload.get("source_device_id") or "Android")
             edge = str(payload.get("edge", "right"))
             timeout_sec = float(payload.get("timeout_seconds", 6.0))
-            expires_at = float(payload.get("expires_at", time.time() + timeout_sec))
+            # Always compute local deadline from relative timeout to avoid cross-device clock skew
+            expires_at = time.time() + timeout_sec
 
             # Arm camera gesture confirmation (never initiates handoff on its own!)
             self._gesture_confirm.arm_for_incoming_offer(handoff_id, expires_at)

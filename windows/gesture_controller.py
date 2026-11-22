@@ -50,8 +50,9 @@ class GesturePetController:
         recognizer: GestureRecognizer,
         handoff_confirm: HandoffGestureConfirmationController,
         *,
-        edge_padding: float = 0.10,
-        release_grace_frames: int = 4,
+        edge_padding: float = 0.22,
+        edge_padding_y: float = 0.18,
+        release_grace_frames: int = 6,
         fist_sleep_seconds: float = 0.70,
         jump_flick_vy_threshold: float = -0.80,
         wave_pet_vx_threshold: float = 0.50,
@@ -63,7 +64,8 @@ class GesturePetController:
         self.engine = engine
         self.recognizer = recognizer
         self.handoff_confirm = handoff_confirm
-        self._edge_padding = min(0.30, max(0.0, float(edge_padding)))
+        self._edge_padding_x = min(0.35, max(0.0, float(edge_padding)))
+        self._edge_padding_y = min(0.35, max(0.0, float(edge_padding_y)))
         self._release_grace_frames = max(1, int(release_grace_frames))
         self._fist_sleep_seconds = max(0.1, float(fist_sleep_seconds))
         self._jump_flick_vy_threshold = float(jump_flick_vy_threshold)
@@ -107,18 +109,45 @@ class GesturePetController:
     def last_event(self) -> GestureEvent | None:
         return self._last_event
 
-    def map_hand_to_desktop(self, palm: Point2D) -> tuple[float, float]:
-        """Map normalized hand coordinates onto the primary monitor with comfortable edge margins."""
-        pad = self._edge_padding
-        span = max(0.1, 1.0 - 2.0 * pad)
-        nx = min(1.0, max(0.0, (palm.x - pad) / span))
-        ny = min(1.0, max(0.0, (palm.y - pad) / span))
+    @property
+    def control_zone_norm(self) -> tuple[float, float, float, float]:
+        """Normalized (x, y, w, h) region of the camera frame mapped to 100% of the desktop.
 
-        screen = self.engine.bounds.primary_screen
-        usable_w = max(0, screen.width - self.engine.pet_width)
-        usable_h = max(0, screen.height - self.engine.pet_height)
-        tx = float(screen.left) + nx * usable_w
-        ty = float(screen.top) + ny * usable_h
+        Optimized for 640x480 webcams so the user can comfortably reach every outer screen edge
+        without their hand leaving the camera field of view.
+        """
+        roi = self.recognizer.detector.roi_norm
+        if roi is not None:
+            rx, ry, rw, rh = roi
+            inner_pad_x = rw * 0.14
+            inner_pad_y = rh * 0.14
+            return (
+                rx + inner_pad_x,
+                ry + inner_pad_y,
+                max(0.10, rw - 2.0 * inner_pad_x),
+                max(0.10, rh - 2.0 * inner_pad_y),
+            )
+        px = self._edge_padding_x
+        py = self._edge_padding_y
+        return (px, py, max(0.10, 1.0 - 2.0 * px), max(0.10, 1.0 - 2.0 * py))
+
+    def map_hand_to_desktop(self, palm: Point2D) -> tuple[float, float]:
+        """Map normalized hand coordinates inside the active camera zone onto 100% of the desktop."""
+        zx, zy, zw, zh = self.control_zone_norm
+        nx = min(1.0, max(0.0, (palm.x - zx) / max(0.08, zw)))
+        ny = min(1.0, max(0.0, (palm.y - zy) / max(0.08, zh)))
+
+        bounds = self.engine.bounds
+        v_left = bounds.virtual_left
+        v_top = bounds.virtual_top
+        v_width = max(1, bounds.virtual_right - bounds.virtual_left)
+        v_height = max(1, bounds.virtual_bottom - bounds.virtual_top)
+
+        usable_w = max(0, v_width - self.engine.pet_width)
+        usable_h = max(0, v_height - self.engine.pet_height)
+        tx = float(v_left) + nx * usable_w
+        ty = float(v_top) + ny * usable_h
+        tx, ty, _ = bounds.clamp_pet_position(tx, ty, self.engine.pet_width, self.engine.pet_height)
         return tx, ty
 
     def _release_gesture_drag(self) -> bool:

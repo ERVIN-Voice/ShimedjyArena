@@ -227,6 +227,18 @@ class HandCamTests {
         assertEquals("Gaming-PC", parsed.sourceDeviceName)
         assertEquals("love", parsed.emotion)
         assertEquals(PetEmotion.LOVE, HubProtocolCodec.petEmotionFromProtocol(parsed.emotion))
+
+        // Auto-accept confirmation source is preserved for zero-tap phone receive
+        val autoConfirmJson = HubProtocolCodec.buildHandoffConfirm(
+            handoffId = "ho-999",
+            deviceId = "android-1",
+            accepted = true,
+            confirmationSource = "auto",
+            landingX = 120f,
+            landingY = 600f,
+        )
+        assertTrue(autoConfirmJson.contains("\"confirmation_source\":\"auto\""))
+        assertTrue(autoConfirmJson.contains("\"accepted\":true"))
     }
 
     @Test

@@ -232,3 +232,26 @@ async def test_wrong_target_cannot_confirm_handoff() -> None:
         assert store.state == "HANDOFF_PENDING"
     finally:
         await mgr.shutdown()
+
+
+async def test_auto_confirmation_source_accepted_for_instant_phone_receive() -> None:
+    store, _, mgr = _make_setup(initial_owner="win-1", timeout_seconds=2.0)
+    try:
+        init_out = await mgr.initiate_handoff(
+            source_device_id="win-1",
+            target_device_id="android-1",
+            edge="right",
+        )
+        conf_out = await mgr.confirm_handoff(
+            handoff_id=init_out.handoff.handoff_id,
+            device_id="android-1",
+            accepted=True,
+            confirmation_source="auto",
+        )
+        assert conf_out.completed is True
+        assert conf_out.handoff.confirmation_source == "auto"
+        assert store.owner == "android-1"
+        assert store.state == "ACTIVE"
+    finally:
+        await mgr.shutdown()
+

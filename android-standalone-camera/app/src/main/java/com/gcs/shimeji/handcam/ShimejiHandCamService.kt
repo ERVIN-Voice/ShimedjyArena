@@ -55,6 +55,7 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
     private var offerOverlayView: HandoffOfferOverlayView? = null
     private var offerAttached = false
     private var pendingIncomingOffer: HubEvent.HandoffOffer? = null
+    private var lastAcceptedHandoffId: String? = null
     private var isLocalOwner: Boolean = true
     private var isHandoffPendingOutgoing: Boolean = false
     private var hasOnlinePcPeer: Boolean = false
@@ -331,19 +332,23 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
             }
 
             is HubEvent.HandoffOffer -> {
-                pendingIncomingOffer = event
-                showIncomingOfferOverlay(event)
+                // Auto-accept immediately on phone — no manual tap/gesture required and immune to clock skew
+                autoAcceptIncomingOffer(event)
             }
 
             is HubEvent.HandoffComplete -> {
                 dismissIncomingOfferOverlay()
                 isHandoffPendingOutgoing = false
                 if (event.newOwner == deviceId) {
-                    val incomingEmo = HubProtocolCodec.petEmotionFromProtocol(event.emotion)
-                    physics.receiveFromHub(event.edge, event.normalizedY, incomingEmo)
+                    if (lastAcceptedHandoffId != event.handoffId) {
+                        val incomingEmo = HubProtocolCodec.petEmotionFromProtocol(event.emotion)
+                        physics.receiveFromHub(event.edge, event.normalizedY, incomingEmo)
+                    }
+                    lastAcceptedHandoffId = null
                     setPetOwnedLocally(true)
                     syncWindowPosition()
                 } else {
+                    lastAcceptedHandoffId = null
                     setPetOwnedLocally(false)
                 }
             }
@@ -433,6 +438,29 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
         offerAttached = false
     }
 
+    private fun autoAcceptIncomingOffer(offer: HubEvent.HandoffOffer) {
+        dismissIncomingOfferOverlay()
+        val client = hubClient ?: return
+        lastAcceptedHandoffId = offer.handoffId
+        isHandoffPendingOutgoing = false
+        val incomingEmo = HubProtocolCodec.petEmotionFromProtocol(offer.emotion)
+        if (viewAttached) {
+            physics.receiveFromHub(offer.edge, offer.normalizedY, incomingEmo)
+            setPetOwnedLocally(true)
+            syncWindowPosition()
+        } else {
+            isLocalOwner = true
+            HandCamRuntimeState.setPetOwnedLocally(true)
+        }
+        client.sendHandoffConfirm(
+            handoffId = offer.handoffId,
+            accepted = true,
+            confirmationSource = "auto",
+            landingX = if (viewAttached) physics.x else 0f,
+            landingY = if (viewAttached) physics.y else 0f,
+        )
+    }
+
     private fun confirmIncomingOffer(accepted: Boolean, source: String) {
         val offer = pendingIncomingOffer ?: return
         dismissIncomingOfferOverlay()
@@ -514,19 +542,7 @@ class ShimejiHandCamService : LifecycleService(), SensorEventListener, Choreogra
         }
         lastFrameNanos = frameTimeNanos
 
-        // Check incoming handoff offer timeout + hands-free camera Open Palm confirmation
-        val activeOffer = pendingIncomingOffer
-        if (activeOffer != null) {
-            val nowSec = System.currentTimeMillis() / 1000.0
-            if (nowSec > activeOffer.expiresAtSec) {
-                dismissIncomingOfferOverlay()
-            } else if (settings.cameraControlEnabled) {
-                val handFrame = latestHandFrame.get()
-                if (handFrame != null && handFrame.detected && handFrame.gesture == HandGesture.OPEN_PALM) {
-                    confirmIncomingOffer(accepted = true, source = "gesture")
-                }
-            }
-        }
+        // Incoming offers are auto-accepted immediately upon arrival; keep frame loop focused on physics/camera.
 
         if (isLocalOwner && !isHandoffPendingOutgoing) {
             if (settings.cameraControlEnabled) {
