@@ -1,0 +1,2 @@
+-keep class com.gcs.shimeji.handcam.** { *; }
+-keep class com.google.mediapipe.** { *; }
