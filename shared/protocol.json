@@ -1,0 +1,129 @@
+{
+  "protocol_name": "GCS-Shimeji-WS",
+  "protocol_version": "1.0.0",
+  "network": {
+    "default_host": "0.0.0.0",
+    "default_port": 8765,
+    "mdns_service_type": "_gcs-shimeji._tcp.local.",
+    "mdns_service_name": "GCS-Shimeji-Hub",
+    "heartbeat_interval_seconds": 10.0,
+    "heartbeat_timeout_seconds": 30.0,
+    "reconnect_initial_delay_seconds": 1.0,
+    "reconnect_max_delay_seconds": 15.0,
+    "qr_scheme": "gcs-shimeji://pair"
+  },
+  "handoff": {
+    "default_timeout_seconds": 6.0,
+    "min_timeout_seconds": 5.0,
+    "max_timeout_seconds": 8.0,
+    "allowed_confirmation_sources": [
+      "touch",
+      "click",
+      "keyboard",
+      "gesture"
+    ],
+    "allowed_edges": [
+      "left",
+      "right",
+      "top",
+      "bottom"
+    ]
+  },
+  "enums": {
+    "device_types": [
+      "windows",
+      "android"
+    ],
+    "avatar_states": [
+      "ACTIVE",
+      "DRAGGING",
+      "HANDOFF_PENDING",
+      "SLEEPING"
+    ],
+    "animations": [
+      "idle",
+      "walk",
+      "run",
+      "jump",
+      "sleep",
+      "grab",
+      "handoff",
+      "receive",
+      "landing"
+    ],
+    "facing": [
+      "left",
+      "right"
+    ]
+  },
+  "envelope": {
+    "required_fields": [
+      "type",
+      "message_id",
+      "timestamp",
+      "payload"
+    ]
+  },
+  "messages": {
+    "register_device": {
+      "direction": "client_to_hub",
+      "payload_fields": ["device_id", "device_type", "device_name", "screen_width", "screen_height", "capabilities"]
+    },
+    "register_ack": {
+      "direction": "hub_to_client",
+      "payload_fields": ["device_id", "hub_version", "protocol_version", "avatar_state", "devices"]
+    },
+    "device_list": {
+      "direction": "hub_to_all",
+      "payload_fields": ["devices"]
+    },
+    "state_sync": {
+      "direction": "hub_to_all",
+      "payload_fields": ["owner", "position", "animation", "state", "facing", "handoff_id", "version", "updated_at"]
+    },
+    "state_update": {
+      "direction": "owner_to_hub",
+      "payload_fields": ["device_id", "position", "animation", "state", "facing"]
+    },
+    "avatar_event": {
+      "direction": "client_to_hub",
+      "payload_fields": ["device_id", "event", "data"]
+    },
+    "handoff_request": {
+      "direction": "owner_to_hub",
+      "payload_fields": ["source_device_id", "target_device_id", "edge", "normalized_y", "idempotency_key"]
+    },
+    "handoff_pending": {
+      "direction": "hub_to_source",
+      "payload_fields": ["handoff_id", "source_device_id", "target_device_id", "expires_at", "timeout_seconds"]
+    },
+    "handoff_offer": {
+      "direction": "hub_to_target",
+      "payload_fields": ["handoff_id", "source_device_id", "source_device_type", "edge", "normalized_y", "expires_at", "timeout_seconds", "avatar_state"]
+    },
+    "handoff_confirm": {
+      "direction": "target_to_hub",
+      "payload_fields": ["handoff_id", "device_id", "accepted", "confirmation_source", "landing_position"]
+    },
+    "handoff_complete": {
+      "direction": "hub_to_all",
+      "payload_fields": ["handoff_id", "previous_owner", "new_owner", "confirmation_source", "avatar_state"]
+    },
+    "handoff_cancel": {
+      "direction": "hub_to_all",
+      "payload_fields": ["handoff_id", "reason", "restored_owner", "avatar_state"]
+    },
+    "ping": {
+      "direction": "bidirectional",
+      "payload_fields": ["sent_at"]
+    },
+    "pong": {
+      "direction": "bidirectional",
+      "payload_fields": ["sent_at", "received_at"]
+    },
+    "error": {
+      "direction": "hub_to_client",
+      "payload_fields": ["code", "message", "ref_message_id"]
+    }
+  }
+}

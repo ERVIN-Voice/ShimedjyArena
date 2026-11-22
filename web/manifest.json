@@ -1,0 +1,19 @@
+{
+  "name": "GCS Shimeji Companion",
+  "short_name": "GCS Shimeji",
+  "description": "Local Wi-Fi pixel companion synced with your Windows desktop",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f1420",
+  "theme_color": "#0f1420",
+  "icons": [
+    {
+      "src": "/assets/avatar/icon.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
