@@ -136,9 +136,9 @@ class HandCamTests {
         assertEquals(PetMood.DRAGGED, physics.mood)
         assertTrue("Pinch should lift pet up into the air", physics.y < 1400f)
 
-        // Release pinch cleanly
+        // Release pinch cleanly and let pet settle on floor
         physics.applyHandGesture(HandGestureFrame(detected = false, gesture = HandGesture.NONE), 1f / 60f)
-        repeat(140) { physics.step(1f / 60f) }
+        repeat(240) { physics.step(1f / 60f) }
 
         // 3) OPEN PALM wave pets with LOVE
         physics.applyHandGesture(
@@ -148,7 +148,7 @@ class HandCamTests {
         assertEquals(PetEmotion.LOVE, physics.emotion)
 
         // 4) Sustained FIST puts pet to sleep (SLEEPY)
-        repeat(45) {
+        repeat(50) {
             physics.applyHandGesture(
                 HandGestureFrame(detected = true, gesture = HandGesture.FIST, palmX = 0.5f, palmY = 0.5f),
                 1f / 60f,

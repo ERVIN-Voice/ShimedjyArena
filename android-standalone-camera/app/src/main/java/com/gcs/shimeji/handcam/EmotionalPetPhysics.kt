@@ -140,8 +140,9 @@ class EmotionalPetPhysics(
     /** Expressive manual triggers for UI buttons or interactions. */
     fun petWithLove() {
         annoyanceScore = 0f
+        val floorY = (screenHeight - petSizePx).coerceAtLeast(0f)
         if (mood == PetMood.SLEEP || mood == PetMood.DIZZY || mood == PetMood.SPLAT || mood == PetMood.TUMBLING) {
-            mood = PetMood.IDLE
+            mood = if (y < floorY - 2f) PetMood.JUMP else PetMood.IDLE
             vx = 0f
             vy = 0f
             rotationDeg = 0f
@@ -629,6 +630,12 @@ class EmotionalPetPhysics(
         val maxX = (screenWidth - petSizePx).coerceAtLeast(0f)
 
         if (y < floorY - 1f) {
+            if (mood == PetMood.SLEEP) {
+                vy += 1200f * dt
+                y = (y + vy * dt).coerceAtMost(floorY)
+                if (y >= floorY) vy = 0f
+                return
+            }
             mood = PetMood.JUMP
             animationName = "jump"
             return
