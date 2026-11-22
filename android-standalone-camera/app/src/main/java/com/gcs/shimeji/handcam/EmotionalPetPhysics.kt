@@ -41,6 +41,7 @@ class EmotionalPetPhysics(
     petSizePx: Float,
     private val random: Random = Random.Default,
     private val onBonk: ((impactSpeed: Float) -> Unit)? = null,
+    private val onEdgeHandoff: ((edge: String, normalizedY: Float) -> Unit)? = null,
 ) {
     var screenWidth: Float = screenWidth.coerceAtLeast(petSizePx + 16f)
         private set
@@ -78,6 +79,12 @@ class EmotionalPetPhysics(
     var tiltPhysicsEnabled: Boolean = true
     var tiltSensitivity: Float = 0.65f
     var bounciness: Float = 0.65f
+    var edgeHandoffEnabled: Boolean = false
+
+    // Edge-drag handoff dwell state (Android -> PC)
+    private var edgeDwellEdge: String? = null
+    private var edgeDwellSec: Float = 0f
+    private var edgeHandoffFired: Boolean = false
 
     // Hand gesture runtime state
     var isHandGrabbing: Boolean = false
@@ -340,6 +347,44 @@ class EmotionalPetPhysics(
         }
     }
 
+    fun protocolState(): String = when (mood) {
+        PetMood.DRAGGED -> "DRAGGING"
+        PetMood.SLEEP -> "SLEEPING"
+        else -> "ACTIVE"
+    }
+
+    fun protocolFacing(): String = if (facingRight) "right" else "left"
+
+    /** Materialize pet on Android screen after accepting an incoming handoff from PC. */
+    fun receiveFromHub(edge: String, normalizedY: Float, incomingEmotion: PetEmotion) {
+        val maxX = (screenWidth - petSizePx).coerceAtLeast(0f)
+        val maxY = (screenHeight - petSizePx).coerceAtLeast(0f)
+        val inset = 24f.coerceAtMost(maxX * 0.25f)
+
+        x = when (edge) {
+            "right" -> inset
+            "left" -> (maxX - inset).coerceAtLeast(0f)
+            else -> maxX * 0.5f
+        }
+        y = (normalizedY.coerceIn(0.1f, 0.85f) * maxY).coerceIn(0f, maxY)
+        facingRight = edge != "left"
+        vx = (if (facingRight) 1f else -1f) * 180f
+        vy = -280f
+        rotationDeg = 0f
+        angularVelocityDeg = 0f
+        scaleX = 0.84f
+        scaleY = 1.22f
+        mood = PetMood.JUMP
+        animationName = "receive"
+        isHandGrabbing = false
+        handPointTargetX = null
+        edgeDwellEdge = null
+        edgeDwellSec = 0f
+        edgeHandoffFired = false
+        val emo = if (incomingEmotion == PetEmotion.NEUTRAL) PetEmotion.HAPPY else incomingEmotion
+        setEmotion(emo, 3.6f, "Привет! ✨")
+    }
+
     fun startDrag(screenX: Float, screenY: Float) {
         mood = PetMood.DRAGGED
         animationName = "grab"
@@ -347,6 +392,9 @@ class EmotionalPetPhysics(
         vy = 0f
         angularVelocityDeg = 0f
         handPointTargetX = null
+        edgeDwellEdge = null
+        edgeDwellSec = 0f
+        edgeHandoffFired = false
     }
 
     fun updateDrag(dx: Float, dy: Float, dt: Float) {
@@ -364,10 +412,44 @@ class EmotionalPetPhysics(
         if (hypot(vx, vy) > 520f && emotion != PetEmotion.SCARED) {
             setEmotion(PetEmotion.SCARED, 1.5f, "Полегче!")
         }
+
+        // Detect edge-hold for Android -> PC handoff when connected to PC Hub
+        if (edgeHandoffEnabled && onEdgeHandoff != null) {
+            val maxX = (screenWidth - petSizePx).coerceAtLeast(0f)
+            val edgeMargin = 14f
+            val detectedEdge = when {
+                x <= edgeMargin -> "left"
+                x >= maxX - edgeMargin -> "right"
+                y <= edgeMargin -> "top"
+                else -> null
+            }
+            if (detectedEdge != null) {
+                if (detectedEdge == edgeDwellEdge) {
+                    edgeDwellSec += safeDt
+                } else {
+                    edgeDwellEdge = detectedEdge
+                    edgeDwellSec = safeDt
+                    edgeHandoffFired = false
+                    showComic("К ПК ->", 0.55f)
+                }
+                if (edgeDwellSec >= 0.42f && !edgeHandoffFired) {
+                    edgeHandoffFired = true
+                    val normY = ((y + petSizePx * 0.5f) / screenHeight.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                    onEdgeHandoff.invoke(detectedEdge, normY)
+                }
+            } else {
+                edgeDwellEdge = null
+                edgeDwellSec = 0f
+                edgeHandoffFired = false
+            }
+        }
     }
 
     fun endDrag() {
         if (mood != PetMood.DRAGGED) return
+        edgeDwellEdge = null
+        edgeDwellSec = 0f
+        edgeHandoffFired = false
         val throwSpeed = hypot(vx, vy)
         if (throwSpeed > 400f) {
             val dir = if (abs(vx) > 20f) sign(vx) else (if (facingRight) 1f else -1f)

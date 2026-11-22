@@ -184,6 +184,9 @@ class PetEngine:
         self.facing: str = "right"
         self.state: str = "ACTIVE"
         self.animation: str = "idle"
+        self.emotion: str = "neutral"
+        self.emotion_timer: float = 0.0
+        self.effect_phase: float = 0.0
         self.is_owner: bool = True
         self.is_visible: bool = True
 
@@ -319,6 +322,32 @@ class PetEngine:
             self.animation = "landing"
         self._behavior_timer = self._next_behavior_interval()
 
+    def set_emotion(self, emotion: str, duration_seconds: float = 3.2) -> None:
+        """Set one of the 8 unified cross-device pet emotions."""
+        valid = {"neutral", "happy", "love", "excited", "scared", "dizzy", "angry", "sleepy"}
+        norm = str(emotion).strip().lower()
+        if norm not in valid:
+            norm = "neutral"
+        self.emotion = norm
+        self.emotion_timer = max(0.0, float(duration_seconds)) if norm != "neutral" else 0.0
+
+    def pet_with_love(self) -> None:
+        """React to petting/waving with LOVE hearts and calm down if sleeping/angry."""
+        if not self.is_owner or self.state == "HANDOFF_PENDING":
+            return
+        if self.state == "SLEEPING":
+            self.wake_up()
+        self.set_emotion("love", duration_seconds=3.6)
+
+    def celebrate_peace(self) -> None:
+        """React to PEACE gesture with a joyful jump and LOVE hearts."""
+        if not self.is_owner or self._dragging or self.state == "HANDOFF_PENDING":
+            return
+        if self.state == "SLEEPING":
+            self.wake_up()
+        self.trigger_jump()
+        self.set_emotion("love", duration_seconds=3.4)
+
     def trigger_jump(self) -> None:
         """Cause the pet to jump vertically from the floor."""
         if not self.is_owner or self._dragging or self.state == "HANDOFF_PENDING":
@@ -329,6 +358,8 @@ class PetEngine:
             self.vy = self.config.behavior.jump_velocity_px_per_sec
             self.animation = "jump"
             self._idle_elapsed = 0.0
+            if self.emotion not in ("love", "angry"):
+                self.set_emotion("happy", duration_seconds=2.4)
 
     def trigger_sleep(self) -> None:
         """Put the pet into sleep state."""
@@ -337,6 +368,7 @@ class PetEngine:
         self.vx = 0.0
         self.state = "SLEEPING"
         self.animation = "sleep"
+        self.set_emotion("sleepy", duration_seconds=8.0)
 
     @property
     def is_dragging(self) -> bool:
@@ -365,6 +397,7 @@ class PetEngine:
         else:
             self.vx = direction * beh.walk_speed_px_per_sec
             self.animation = "walk"
+        self.set_emotion("excited", duration_seconds=2.0)
         # Prevent autonomous AI from immediately overriding the user's hand guidance
         self._behavior_timer = 1.2
 
@@ -375,6 +408,8 @@ class PetEngine:
         self.state = "ACTIVE"
         self.animation = "idle"
         self._idle_elapsed = 0.0
+        if self.emotion == "sleepy":
+            self.set_emotion("happy", duration_seconds=2.0)
 
     def enter_handoff_pending(self) -> None:
         """Transition into outgoing handoff pending state and stop autonomous movement."""
@@ -443,10 +478,15 @@ class PetEngine:
         return self.x, self.y
 
     def tick(self, dt: float) -> None:
-        """Advance physics, smooth drag interpolation, edge detection, and autonomous behavior."""
+        """Advance physics, smooth drag interpolation, edge detection, emotions, and autonomous behavior."""
         if dt <= 0.0 or not self.is_owner or not self.is_visible:
             return
         dt = min(dt, 0.1)  # Guard against large frame stalls
+        self.effect_phase += dt * 5.2
+        if self.emotion_timer > 0.0:
+            self.emotion_timer = max(0.0, self.emotion_timer - dt)
+            if self.emotion_timer <= 0.0 and self.state != "SLEEPING":
+                self.emotion = "neutral"
 
         beh = self.config.behavior
 

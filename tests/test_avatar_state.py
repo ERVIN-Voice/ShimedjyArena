@@ -87,3 +87,26 @@ def test_atomic_handoff_commit_and_rollback() -> None:
     assert committed.handoff_id is None
     assert committed.position.x == 42.0
     assert committed.position.y == 500.0
+
+
+def test_unified_emotion_preserved_across_handoff_commit_and_rollback() -> None:
+    store = AvatarStateStore(initial_owner="android-1")
+    snap = store.update_from_owner("android-1", emotion="love", animation="jump")
+    assert snap.emotion == "love"
+    assert snap.to_dict()["emotion"] == "love"
+
+    # Invalid emotion rejected
+    with pytest.raises(AvatarStateError):
+        store.update_from_owner("android-1", emotion="unknown_mood")
+
+    # Rollback preserves emotion
+    store.begin_handoff("ho-emo-1", expected_owner="android-1")
+    rolled = store.rollback_handoff("ho-emo-1")
+    assert rolled.emotion == "love"
+
+    # Commit carries emotion to PC
+    store.begin_handoff("ho-emo-2", expected_owner="android-1")
+    committed = store.commit_handoff("ho-emo-2", new_owner="win-1")
+    assert committed.owner == "win-1"
+    assert committed.emotion == "love"
+

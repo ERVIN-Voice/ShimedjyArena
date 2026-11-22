@@ -44,16 +44,20 @@ logger = logging.getLogger(__name__)
 
 
 class PairingDialog(QDialog):
-    """Displays local Android Web Companion URL, pairing URI, and scannable QR code."""
+    """Displays local LAN WebSocket URL (for Shimeji Hand Cam Android app), Web URL, and QR code."""
 
-    def __init__(self, pairing_uri: str, web_url: str, qr_png_path: Path) -> None:
+    def __init__(self, pairing_uri: str, web_url: str, qr_png_path: Path, ws_url: str = "") -> None:
         super().__init__(None)
         self.setWindowTitle("GCS Shimeji — Connect Android")
         layout = QVBoxLayout(self)
 
-        title = QLabel("Scan QR code on Android (opens Web Companion in App or Browser):")
-        web_lbl = QLabel(f"Android Web URL:  {web_url}")
-        web_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #0b6e4f;")
+        title = QLabel("Connect Android Shimeji Hand Cam app (auto-discovered via Wi-Fi, or enter Hub WS URL):")
+        ws_lbl = QLabel(f"Android App Hub URL:  {ws_url or pairing_uri}")
+        ws_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #0b6e4f;")
+        ws_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        web_lbl = QLabel(f"Browser Web Client :  {web_url}")
+        web_lbl.setStyleSheet("font-size: 12px; color: #2b5b84;")
         web_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         uri_lbl = QLabel(f"Pairing URI:  {pairing_uri}")
@@ -66,6 +70,7 @@ class PairingDialog(QDialog):
             qr_lbl.setPixmap(pix)
 
         layout.addWidget(title)
+        layout.addWidget(ws_lbl)
         layout.addWidget(web_lbl)
         layout.addWidget(qr_lbl)
         layout.addWidget(uri_lbl)
@@ -126,6 +131,7 @@ class DesktopPetApp(QObject):
         self._window.request_handoff.connect(self._trigger_manual_handoff)
         self._window.request_scale_delta.connect(self._adjust_scale)
         self._window.request_toggle_sleep.connect(self._toggle_sleep)
+        self._window.request_pet_love.connect(self._pet_with_love)
         self._window.request_show_pairing.connect(self.show_pairing_dialog)
         self._window.request_toggle_camera_hud.connect(self.toggle_camera_preview)
         self._window.request_quit.connect(self.shutdown)
@@ -428,17 +434,23 @@ class DesktopPetApp(QObject):
             self._engine.trigger_sleep()
         self._push_state_to_hub(force=True)
 
+    def _pet_with_love(self) -> None:
+        self._engine.pet_with_love()
+        self._push_state_to_hub(force=True)
+
     def show_pairing_dialog(self) -> None:
+        lan_ip = detect_local_ip()
         if self._embedded_hub is not None:
             uri = self._embedded_hub.hub.pairing_uri
             web_url = self._embedded_hub.hub.web_url
+            ws_url = f"ws://{lan_ip}:{self._embedded_hub.hub.actual_port}"
         else:
-            lan_ip = detect_local_ip()
             web_port = self.hub_port + 1
             web_url = f"http://{lan_ip}:{web_port}"
+            ws_url = f"ws://{lan_ip}:{self.hub_port}"
             uri = build_pairing_uri("0.0.0.0", self.hub_port, self.protocol, web_port=web_port)
         qr_path = save_pairing_qr_png(web_url, Path("pairing_qr.png"))
-        dialog = PairingDialog(uri, web_url, qr_path)
+        dialog = PairingDialog(uri, web_url, qr_path, ws_url=ws_url)
         dialog.exec()
 
     def _tick(self) -> None:
@@ -474,6 +486,7 @@ class DesktopPetApp(QObject):
                         show_mask=self._camera_preview.show_mask,
                         handoff_armed=(self._gesture_confirm.pending_handoff_id is not None),
                         roi_norm=self._hand_detector.roi_norm,
+                        pet_emotion=self._engine.emotion,
                     )
                     self._camera_preview.update_frame(annotated, status_text=update.active_action)
 
@@ -491,6 +504,8 @@ class DesktopPetApp(QObject):
                 is_sleeping=(self._engine.state == "SLEEPING"),
                 can_handoff=self._has_online_peer(),
                 has_camera=(self._camera_preview is not None),
+                emotion=self._engine.emotion,
+                effect_phase=self._engine.effect_phase,
             )
             self._render_current_frame()
             self._window.move_to(self._engine.x, self._engine.y)
@@ -525,6 +540,7 @@ class DesktopPetApp(QObject):
             animation=self._engine.animation,
             state=self._engine.state,
             facing=self._engine.facing,
+            emotion=self._engine.emotion,
         )
 
     def _handle_hub_event(self, event: HubClientEvent) -> None:
@@ -569,6 +585,9 @@ class DesktopPetApp(QObject):
                 norm_y = float(payload.get("normalized_y", 0.5))
                 if not self._engine.is_owner or not self._engine.is_visible:
                     self._engine.receive_from_edge(edge, norm_y)
+                avatar_state = payload.get("avatar_state")
+                if isinstance(avatar_state, dict) and avatar_state.get("emotion"):
+                    self._engine.set_emotion(str(avatar_state["emotion"]), duration_seconds=4.0)
                 self._anim.play("receive", restart=True)
             else:
                 self._engine.complete_outgoing_handoff()

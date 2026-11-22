@@ -318,6 +318,36 @@ async def test_windows_hub_client_and_embedded_hub_handoff_and_reconnect() -> No
             assert comp["payload"]["new_owner"] == "win-app-1"
             assert comp["payload"]["confirmation_source"] == "gesture"
             assert runner.hub.state_store.owner == "win-app-1"
+            # Consume the post-handoff state_sync broadcast before sending our new emotion update
+            await _recv_until(ws_and, "state_sync")
+
+            # Verify unified emotion travels end-to-end PC -> Android -> PC across WebSocket handoffs
+            win_client.send_state_update(
+                x=420.0,
+                y=600.0,
+                animation="jump",
+                state="ACTIVE",
+                facing="right",
+                emotion="love",
+            )
+            sync_msg = await _recv_until(ws_and, "state_sync")
+            assert sync_msg["payload"]["emotion"] == "love"
+
+            win_client.send_handoff_request(edge="right", normalized_y=0.5)
+            emo_offer = await _recv_until(ws_and, "handoff_offer")
+            assert emo_offer["payload"]["avatar_state"]["emotion"] == "love"
+            await _send(
+                ws_and,
+                "handoff_confirm",
+                {
+                    "handoff_id": emo_offer["payload"]["handoff_id"],
+                    "device_id": "and-app-1",
+                    "accepted": True,
+                    "confirmation_source": "gesture",
+                },
+            )
+            emo_comp = await _recv_until(ws_and, "handoff_complete")
+            assert emo_comp["payload"]["avatar_state"]["emotion"] == "love"
     finally:
         win_client.stop_background()
         runner.stop()

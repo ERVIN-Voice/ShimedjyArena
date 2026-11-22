@@ -54,6 +54,16 @@
     "facing": [
       "left",
       "right"
+    ],
+    "emotions": [
+      "neutral",
+      "happy",
+      "love",
+      "excited",
+      "scared",
+      "dizzy",
+      "angry",
+      "sleepy"
     ]
   },
   "envelope": {
@@ -79,11 +89,11 @@
     },
     "state_sync": {
       "direction": "hub_to_all",
-      "payload_fields": ["owner", "position", "animation", "state", "facing", "handoff_id", "version", "updated_at"]
+      "payload_fields": ["owner", "position", "animation", "state", "facing", "emotion", "handoff_id", "version", "updated_at"]
     },
     "state_update": {
       "direction": "owner_to_hub",
-      "payload_fields": ["device_id", "position", "animation", "state", "facing"]
+      "payload_fields": ["device_id", "position", "animation", "state", "facing", "emotion"]
     },
     "avatar_event": {
       "direction": "client_to_hub",

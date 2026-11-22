@@ -1,11 +1,12 @@
 """Real-time gesture control bridge mapping camera hand gestures to PetEngine actions.
 
-Supported live interactions:
+Supported live interactions (unified with Android Shimeji Hand Cam):
 - PINCH (thumb + index together): Grab and drag the pet smoothly across the desktop.
-- POINT (raised index finger): Call the pet so it walks/runs toward your hand's X position.
+- POINT (raised index finger): Call the pet so it walks/runs excitedly toward your hand's X position.
+- PEACE (index + middle V-sign): Joyful celebration jump with LOVE hearts!
 - OPEN PALM (RECEIVE_PET):
     * When an incoming handoff offer is armed -> confirms acceptance (confirmation-only!).
-    * Otherwise -> wakes sleeping pet, or makes pet jump on an upward hand flick.
+    * Otherwise -> wakes sleeping pet, waves sideways to pet with LOVE ♥, or jumps on upward flick.
 - FIST (sustained): Puts the pet to sleep.
 """
 
@@ -52,8 +53,11 @@ class GesturePetController:
         edge_padding: float = 0.10,
         release_grace_frames: int = 4,
         fist_sleep_seconds: float = 0.70,
-        jump_flick_vy_threshold: float = -0.85,
+        jump_flick_vy_threshold: float = -0.80,
+        wave_pet_vx_threshold: float = 0.50,
         jump_cooldown_seconds: float = 0.80,
+        wave_cooldown_seconds: float = 0.90,
+        peace_cooldown_seconds: float = 1.40,
         on_pet_state_changed: Callable[[], None] | None = None,
     ) -> None:
         self.engine = engine
@@ -63,7 +67,10 @@ class GesturePetController:
         self._release_grace_frames = max(1, int(release_grace_frames))
         self._fist_sleep_seconds = max(0.1, float(fist_sleep_seconds))
         self._jump_flick_vy_threshold = float(jump_flick_vy_threshold)
+        self._wave_pet_vx_threshold = float(wave_pet_vx_threshold)
         self._jump_cooldown_seconds = float(jump_cooldown_seconds)
+        self._wave_cooldown_seconds = float(wave_cooldown_seconds)
+        self._peace_cooldown_seconds = float(peace_cooldown_seconds)
         self._on_pet_state_changed = on_pet_state_changed
 
         self._paused: bool = False
@@ -71,6 +78,8 @@ class GesturePetController:
         self._pinch_miss_frames: int = 0
         self._fist_started_at: float | None = None
         self._last_jump_at: float = 0.0
+        self._last_wave_at: float = 0.0
+        self._last_peace_at: float = 0.0
         self._active_action: str = ""
         self._last_event: GestureEvent | None = None
 
@@ -193,7 +202,7 @@ class GesturePetController:
 
         # Handle pinch release grace period to avoid accidental drops on 1-frame camera flicker
         if self._gesture_dragging:
-            if event.gesture in (GestureType.RECEIVE_PET, GestureType.FIST, GestureType.POINT):
+            if event.gesture in (GestureType.RECEIVE_PET, GestureType.FIST, GestureType.POINT, GestureType.PEACE):
                 # Deliberate different gesture -> release immediately
                 state_changed = self._release_gesture_drag()
                 self._active_action = "Released Pet"
@@ -211,15 +220,26 @@ class GesturePetController:
                     state_changed = self._release_gesture_drag()
                     self._active_action = "Released Pet"
 
-        # 3) POINT -> Call pet to walk/run toward hand X coordinate
-        if event.gesture == GestureType.POINT and mapped_pos is not None:
+        # 3) PEACE (V-sign) -> Joyful jump with LOVE hearts!
+        if event.gesture == GestureType.PEACE:
+            self._fist_started_at = None
+            if (now - self._last_peace_at) >= self._peace_cooldown_seconds:
+                self.engine.celebrate_peace()
+                self._last_peace_at = now
+                state_changed = True
+                self._active_action = "PEACE: Yay! Love & Jump!"
+            else:
+                self._active_action = "PEACE: Celebrating!"
+
+        # 4) POINT -> Call pet to walk/run toward hand X coordinate
+        elif event.gesture == GestureType.POINT and mapped_pos is not None:
             self._fist_started_at = None
             target_center_x = mapped_pos[0] + self.engine.pet_width / 2.0
             self.engine.guide_toward_x(target_center_x)
             state_changed = True
             self._active_action = f"POINT: Calling Pet -> X={int(target_center_x)}"
 
-        # 4) OPEN PALM (not armed for handoff) -> Wake pet or Jump on sharp upward flick
+        # 5) OPEN PALM (not armed for handoff) -> Wake pet, Jump on upward flick, or Pet with LOVE on wave
         elif event.gesture == GestureType.RECEIVE_PET:
             self._fist_started_at = None
             if self.engine.state == "SLEEPING":
@@ -234,8 +254,16 @@ class GesturePetController:
                 self._last_jump_at = now
                 state_changed = True
                 self._active_action = "FLICK UP: Pet Jump!"
+            elif (
+                abs(event.palm_vx) >= self._wave_pet_vx_threshold
+                and (now - self._last_wave_at) >= self._wave_cooldown_seconds
+            ):
+                self.engine.pet_with_love()
+                self._last_wave_at = now
+                state_changed = True
+                self._active_action = "WAVE PALM: Petted with LOVE!"
             else:
-                self._active_action = "OPEN PALM: Ready (flick up to jump)"
+                self._active_action = "OPEN PALM: Ready (wave=love, flick up=jump)"
 
         # 5) FIST (sustained) -> Put pet to sleep
         elif event.gesture == GestureType.FIST:

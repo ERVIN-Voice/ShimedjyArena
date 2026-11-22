@@ -182,4 +182,77 @@ class HandCamTests {
         physics.petWithLove()
         assertEquals(PetEmotion.LOVE, physics.emotion)
     }
+
+    @Test
+    fun hubProtocolCodecParsesUrlsAndSerializesUnifiedEmotionsAndHandoff() {
+        assertEquals("ws://192.168.1.42:8765", HubProtocolCodec.parseHubUrl("192.168.1.42"))
+        assertEquals("ws://192.168.1.42:8765", HubProtocolCodec.parseHubUrl("192.168.1.42:8765"))
+        assertEquals("ws://192.168.1.42:8765", HubProtocolCodec.parseHubUrl("http://192.168.1.42:8766"))
+        assertEquals(
+            "ws://192.168.1.42:8765",
+            HubProtocolCodec.parseHubUrl("gcs-shimeji://pair?ws=ws%3A%2F%2F192.168.1.42%3A8765&host=192.168.1.42&port=8765"),
+        )
+
+        val stateJson = HubProtocolCodec.buildStateUpdate(
+            deviceId = "and-001",
+            x = 120f,
+            y = 480f,
+            animation = "walk",
+            state = "ACTIVE",
+            facing = "left",
+            emotion = "love",
+        )
+        assertTrue(stateJson.contains("\"emotion\":\"love\""))
+        assertTrue(stateJson.contains("\"type\":\"state_update\""))
+
+        val incomingOffer = """
+            {
+              "type": "handoff_offer",
+              "message_id": "m1",
+              "timestamp": 100.0,
+              "payload": {
+                "handoff_id": "ho-999",
+                "source_device_id": "win-1",
+                "source_device_name": "Gaming-PC",
+                "edge": "right",
+                "normalized_y": 0.4,
+                "timeout_seconds": 6.0,
+                "expires_at": 9999999999.0,
+                "avatar_state": {"owner": "win-1", "state": "HANDOFF_PENDING", "animation": "handoff", "facing": "right", "emotion": "love"}
+              }
+            }
+        """.trimIndent()
+        val parsed = HubProtocolCodec.parseIncoming(incomingOffer) as HubEvent.HandoffOffer
+        assertEquals("ho-999", parsed.handoffId)
+        assertEquals("Gaming-PC", parsed.sourceDeviceName)
+        assertEquals("love", parsed.emotion)
+        assertEquals(PetEmotion.LOVE, HubProtocolCodec.petEmotionFromProtocol(parsed.emotion))
+    }
+
+    @Test
+    fun edgeDragTriggersAndroidToPcHandoffAndReceiveRestoresEmotion() {
+        val triggered = mutableListOf<Pair<String, Float>>()
+        val physics = EmotionalPetPhysics(
+            screenWidth = 1080f,
+            screenHeight = 1920f,
+            petSizePx = 120f,
+            random = Random(7),
+            onEdgeHandoff = { edge, ny -> triggered.add(edge to ny) },
+        )
+        physics.edgeHandoffEnabled = true
+        physics.x = 955f
+        physics.y = 800f
+
+        physics.startDrag(955f, 800f)
+        repeat(10) {
+            physics.updateDrag(2f, 0f, 0.06f)
+        }
+        assertEquals(1, triggered.size)
+        assertEquals("right", triggered[0].first)
+
+        // Receive back from PC with ANGRY emotion preserved
+        physics.receiveFromHub(edge = "right", normalizedY = 0.5f, incomingEmotion = PetEmotion.ANGRY)
+        assertEquals(PetEmotion.ANGRY, physics.emotion)
+        assertTrue(physics.x < 100f)
+    }
 }

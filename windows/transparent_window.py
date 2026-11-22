@@ -11,11 +11,14 @@ Guarantees:
 from __future__ import annotations
 
 import logging
+import math
 from typing import Callable
 
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import (
     QAction,
+    QColor,
+    QFont,
     QGuiApplication,
     QImage,
     QMouseEvent,
@@ -95,6 +98,7 @@ class TransparentPetWindow(QWidget):
     request_handoff = Signal()
     request_scale_delta = Signal(int)
     request_toggle_sleep = Signal()
+    request_pet_love = Signal()
     request_show_pairing = Signal()
     request_toggle_camera_hud = Signal()
     request_quit = Signal()
@@ -108,6 +112,9 @@ class TransparentPetWindow(QWidget):
         self._is_sleeping: bool = False
         self._can_handoff: bool = False
         self._has_camera: bool = False
+        self._emotion: str = "neutral"
+        self._effect_phase: float = 0.0
+        self._base_region: QRegion = QRegion()
 
         self.setWindowTitle("GCS Shimeji")
         self.setWindowFlags(
@@ -121,10 +128,34 @@ class TransparentPetWindow(QWidget):
         self.setMouseTracking(False)
         self.setFixedSize(width, height)
 
-    def set_context_state(self, *, is_sleeping: bool, can_handoff: bool, has_camera: bool = False) -> None:
+    def set_context_state(
+        self,
+        *,
+        is_sleeping: bool,
+        can_handoff: bool,
+        has_camera: bool = False,
+        emotion: str = "neutral",
+        effect_phase: float = 0.0,
+    ) -> None:
         self._is_sleeping = is_sleeping
         self._can_handoff = can_handoff
         self._has_camera = has_camera
+        needs_repaint = (emotion != self._emotion) or (emotion != "neutral")
+        self._emotion = emotion
+        self._effect_phase = effect_phase
+        if needs_repaint:
+            self._apply_effective_mask()
+            self.update()
+
+    def _apply_effective_mask(self) -> None:
+        if self._base_region.isEmpty():
+            return
+        if self._emotion == "neutral":
+            self.setMask(self._base_region)
+        else:
+            # Include a compact top FX strip above the pet head so floating pixel hearts/stars/Zzz are visible
+            fx_strip = QRegion(QRect(0, 0, self.width(), max(24, int(self.height() * 0.42))))
+            self.setMask(self._base_region.united(fx_strip))
 
     def set_rendered_frame(self, frame: RenderedFrame) -> None:
         """Update displayed pixel frame and refresh the per-pixel click-through window mask."""
@@ -137,7 +168,8 @@ class TransparentPetWindow(QWidget):
             self.setFixedSize(frame.width, frame.height)
 
         self._pixmap = pil_frame_to_pixmap(frame)
-        self.setMask(build_click_through_region(frame))
+        self._base_region = build_click_through_region(frame)
+        self._apply_effective_mask()
         self.update()
 
     def move_to(self, x: float, y: float) -> None:
@@ -155,7 +187,75 @@ class TransparentPetWindow(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         painter.drawPixmap(0, 0, self._pixmap)
+        if self._emotion != "neutral":
+            self._paint_pixel_emotion_fx(painter)
         painter.end()
+
+    def _paint_pixel_emotion_fx(self, painter: QPainter) -> None:
+        w = self.width()
+        h = self.height()
+        px = max(2, int(round(min(w, h) / 32.0)))
+        phase = self._effect_phase
+        emo = self._emotion
+
+        if emo in ("love", "happy"):
+            # Rosy pixel blush cheeks
+            blush = QColor(255, 105, 165, 200) if emo == "love" else QColor(255, 130, 175, 145)
+            painter.fillRect(px * 8, px * 15, px * 3, px * 2, blush)
+            painter.fillRect(w - px * 11, px * 15, px * 3, px * 2, blush)
+
+        if emo == "love":
+            u = max(2, int(px * 0.85))
+            for i in range(2):
+                t = (phase * 0.35 + i * 0.5) % 1.0
+                hx = int(w * 0.5 + (-1 if i == 0 else 1) * (px * 6 + math.sin(phase + i * 2.0) * px * 2))
+                hy = int(px * 8 - t * px * 6)
+                alpha = max(60, min(255, int((1.0 - t) * 255)))
+                col = QColor(255, 92, 148, alpha) if i == 0 else QColor(255, 145, 196, alpha)
+                painter.fillRect(hx - 2 * u, hy - u, u, u, col)
+                painter.fillRect(hx + u, hy - u, u, u, col)
+                painter.fillRect(hx - 2 * u, hy, 5 * u, u, col)
+                painter.fillRect(hx - u, hy + u, 3 * u, u, col)
+                painter.fillRect(hx, hy + 2 * u, u, u, col)
+        elif emo in ("happy", "excited"):
+            colors = (QColor(255, 232, 102), QColor(102, 252, 241))
+            for i in range(3):
+                pulse = 0.5 + 0.5 * math.sin(phase * 1.4 + i * 2.1)
+                sx = int(w * (0.2 + 0.3 * i))
+                sy = int(px * 4 + math.sin(i * 1.8) * px * 2)
+                s = max(2, int(px * (0.7 + pulse * 0.6)))
+                col = colors[i % 2]
+                painter.fillRect(sx - s, sy, s * 2 + 1, max(2, s // 2), col)
+                painter.fillRect(sx, sy - s, max(2, s // 2), s * 2 + 1, col)
+        elif emo == "scared":
+            slide = int(((phase * 0.4) % 1.0) * px * 4)
+            sx = int(w * 0.78)
+            sy = px * 4 + slide
+            painter.fillRect(sx, sy, px, px * 3, QColor(92, 200, 255))
+            painter.fillRect(sx - px // 2, sy + px, px * 2, px * 2, QColor(92, 200, 255))
+        elif emo == "dizzy":
+            cols = (QColor(255, 224, 92), QColor(102, 252, 241), QColor(255, 168, 92))
+            for i in range(3):
+                ang = phase * 1.2 + i * (math.pi * 2.0 / 3.0)
+                sx = int(w * 0.5 + math.cos(ang) * w * 0.30)
+                sy = int(px * 5 + math.sin(ang) * px * 2.2)
+                painter.fillRect(sx - px, sy, px * 2 + 1, px, cols[i])
+                painter.fillRect(sx, sy - px, px, px * 2 + 1, cols[i])
+        elif emo == "angry":
+            ax = int(w * 0.76)
+            ay = px * 6
+            u = max(2, int(px * (0.85 + 0.2 * math.sin(phase * 2.2))))
+            col = QColor(255, 68, 68)
+            painter.fillRect(ax - 2 * u, ay - u, u, u, col)
+            painter.fillRect(ax + u, ay - u, u, u, col)
+            painter.fillRect(ax - 2 * u, ay + u, u, u, col)
+            painter.fillRect(ax + u, ay + u, u, u, col)
+        elif emo == "sleepy":
+            t1 = (phase * 0.22) % 1.0
+            font = QFont("Consolas", max(8, int(px * 2.4)), QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.setPen(QColor(154, 212, 255, max(50, int((1.0 - t1) * 255))))
+            painter.drawText(int(w * 0.62 + t1 * px * 4), int(px * 9 - t1 * px * 6), "Z")
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
@@ -204,6 +304,10 @@ class TransparentPetWindow(QWidget):
         handoff_action.setEnabled(self._can_handoff)
         handoff_action.triggered.connect(self.request_handoff.emit)
         menu.addAction(handoff_action)
+
+        love_action = QAction("Pet with Love ♥", menu)
+        love_action.triggered.connect(self.request_pet_love.emit)
+        menu.addAction(love_action)
 
         sleep_label = "Wake Up" if self._is_sleeping else "Sleep"
         sleep_action = QAction(sleep_label, menu)
