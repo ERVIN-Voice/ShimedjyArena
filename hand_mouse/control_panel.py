@@ -638,10 +638,17 @@ class HandMouseMainWindow(QtWidgets.QWidget):
     def _cleanup(self) -> None:
         self._tick_timer.stop()
         self._stop_camera()
+        if hasattr(self._overlay, "_anim_timer"):
+            self._overlay._anim_timer.stop()
         self._overlay.hide()
         self._overlay.close()
         if self._tray is not None:
             self._tray.hide()
+        if hasattr(self._detector, "close"):
+            try:
+                self._detector.close()
+            except Exception:
+                pass
 
     def quit_app(self) -> None:
         self._quitting = True

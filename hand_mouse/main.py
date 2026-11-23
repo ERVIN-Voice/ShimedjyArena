@@ -163,11 +163,13 @@ def _run_self_test(log_path: str = "") -> int:
         from hand_mouse import control_panel, target_overlay  # noqa: F401
 
         if platform.system() == "Windows":
+            import os
             from PySide6 import QtWidgets
 
             app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
             overlay = target_overlay.ClickTargetOverlayWindow()
             overlay.update_state(s2, use_qt_cursor_pos=False)
+            overlay._anim_timer.stop()
             overlay.close()
             win = control_panel.HandMouseMainWindow(
                 camera_kind="webcam",
@@ -179,8 +181,25 @@ def _run_self_test(log_path: str = "") -> int:
             win._cleanup()
             win.close()
             app.processEvents()
+            if hasattr(detector, "close"):
+                try:
+                    detector.close()
+                except Exception:
+                    pass
             lines.append("OK GUI overlay & control panel instantiated cleanly")
+            lines.append("SELF-TEST PASSED")
+            report = "\n".join(lines) + "\n"
+            if log_path:
+                Path(log_path).write_text(report, encoding="utf-8")
+            print(report, end="", flush=True)
+            # Avoid Windows C++ atexit teardown race between PySide6 QApplication and MediaPipe
+            os._exit(0)
         else:
+            if hasattr(detector, "close"):
+                try:
+                    detector.close()
+                except Exception:
+                    pass
             lines.append("OK GUI overlay & control panel modules imported")
         lines.append("SELF-TEST PASSED")
         report = "\n".join(lines) + "\n"
