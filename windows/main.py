@@ -123,7 +123,11 @@ def _run_self_test(log_path: Path | None = None) -> int:
     import websockets  # noqa: F401
     from PySide6.QtWidgets import QApplication  # noqa: F401
     from server.hub import GCSLocalHub  # noqa: F401
+    from windows import desktop_pet, pet_profile, site_reactor, toy_physics, toy_windows  # noqa: F401
     from windows.hand_detection import DEFAULT_MEDIAPIPE_MODEL_PATH, create_best_hand_detector
+
+    yt = site_reactor.classify_window_title("Funny Cats - YouTube - Google Chrome")
+    assert yt is not None and yt.prop_name == "popcorn", f"YouTube reaction failed: {yt}"
 
     assert DEFAULT_MEDIAPIPE_MODEL_PATH.exists(), f"Missing bundled hand_landmarker.task at {DEFAULT_MEDIAPIPE_MODEL_PATH}"
     det = create_best_hand_detector(prefer_mediapipe=True, auto_download_model=False)

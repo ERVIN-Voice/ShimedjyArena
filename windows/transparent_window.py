@@ -95,6 +95,7 @@ class TransparentPetWindow(QWidget):
     drag_moved = Signal(float, float)
     drag_ended = Signal()
     double_clicked = Signal()
+    pet_hovered = Signal(float, float)
     request_handoff = Signal()
     request_scale_delta = Signal(int)
     request_toggle_sleep = Signal()
@@ -103,6 +104,15 @@ class TransparentPetWindow(QWidget):
     request_show_pairing = Signal()
     request_toggle_camera_hud = Signal()
     request_enable_camera = Signal(str)  # "webcam" | "ps3_eye"
+    request_play_ball = Signal()
+    request_drop_snack = Signal()
+    request_toggle_laser = Signal()
+    request_start_balloons = Signal()
+    request_dance = Signal()
+    request_toggle_site_reactions = Signal()
+    request_preview_site_prop = Signal(str)
+    request_show_profile = Signal()
+    request_toggle_break_reminder = Signal()
     request_quit = Signal()
 
     def __init__(self, width: int, height: int) -> None:
@@ -116,6 +126,12 @@ class TransparentPetWindow(QWidget):
         self._has_camera: bool = False
         self._emotion: str = "neutral"
         self._effect_phase: float = 0.0
+        self._active_prop: str = ""
+        self._site_reactions_enabled: bool = True
+        self._laser_active: bool = False
+        self._ball_active: bool = False
+        self._balloons_active: bool = False
+        self._break_reminder_enabled: bool = False
         self._base_region: QRegion = QRegion()
 
         self.setWindowTitle("GCS Shimeji")
@@ -127,7 +143,7 @@ class TransparentPetWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.setMouseTracking(False)
+        self.setMouseTracking(True)
         self.setFixedSize(width, height)
 
     def set_context_state(
@@ -138,13 +154,30 @@ class TransparentPetWindow(QWidget):
         has_camera: bool = False,
         emotion: str = "neutral",
         effect_phase: float = 0.0,
+        active_prop: str = "",
+        site_reactions_enabled: bool = True,
+        laser_active: bool = False,
+        ball_active: bool = False,
+        balloons_active: bool = False,
+        break_reminder_enabled: bool = False,
     ) -> None:
         self._is_sleeping = is_sleeping
         self._can_handoff = can_handoff
         self._has_camera = has_camera
-        needs_repaint = (emotion != self._emotion) or (emotion != "neutral")
+        self._site_reactions_enabled = site_reactions_enabled
+        self._laser_active = laser_active
+        self._ball_active = ball_active
+        self._balloons_active = balloons_active
+        self._break_reminder_enabled = break_reminder_enabled
+        needs_repaint = (
+            (emotion != self._emotion)
+            or (emotion != "neutral")
+            or (active_prop != self._active_prop)
+            or bool(active_prop)
+        )
         self._emotion = emotion
         self._effect_phase = effect_phase
+        self._active_prop = active_prop
         if needs_repaint:
             self._apply_effective_mask()
             self.update()
@@ -152,12 +185,19 @@ class TransparentPetWindow(QWidget):
     def _apply_effective_mask(self) -> None:
         if self._base_region.isEmpty():
             return
-        if self._emotion == "neutral":
+        if self._emotion == "neutral" and not self._active_prop:
             self.setMask(self._base_region)
-        else:
-            # Include a compact top FX strip above the pet head so floating pixel hearts/stars/Zzz are visible
-            fx_strip = QRegion(QRect(0, 0, self.width(), max(24, int(self.height() * 0.42))))
-            self.setMask(self._base_region.united(fx_strip))
+            return
+
+        region = QRegion(self._base_region)
+        if self._emotion != "neutral" or self._active_prop in ("headphones", "idea", "chat", "sparkle"):
+            # Top FX strip above head for hearts, stars, Zzz, headphones arch, lightbulb, notes
+            region = region.united(QRegion(QRect(0, 0, self.width(), max(26, int(self.height() * 0.48)))))
+        if self._active_prop in ("popcorn", "coffee", "gamepad", "book"):
+            # Lower/front prop zone so popcorn bucket, coffee cup, gamepad, and book never clip
+            prop_top = int(self.height() * 0.36)
+            region = region.united(QRegion(QRect(0, prop_top, self.width(), self.height() - prop_top)))
+        self.setMask(region)
 
     def set_rendered_frame(self, frame: RenderedFrame) -> None:
         """Update displayed pixel frame and refresh the per-pixel click-through window mask."""
@@ -191,7 +231,173 @@ class TransparentPetWindow(QWidget):
         painter.drawPixmap(0, 0, self._pixmap)
         if self._emotion != "neutral":
             self._paint_pixel_emotion_fx(painter)
+        if self._active_prop:
+            self._paint_site_prop(painter)
         painter.end()
+
+    def _paint_site_prop(self, painter: QPainter) -> None:
+        """Draw crisp pixel-art props on the pet reacting to active websites/apps."""
+        w = self.width()
+        h = self.height()
+        px = max(2, int(round(min(w, h) / 32.0)))
+        phase = self._effect_phase
+        prop = self._active_prop
+
+        if prop == "popcorn":
+            # Striped red & white popcorn bucket held in front + munching kernel hop!
+            bx = int(w * 0.50 - px * 4.5)
+            by = int(h * 0.58)
+            bw = px * 9
+            bh = px * 7
+            # Dark pixel outline
+            painter.fillRect(bx - px, by - px, bw + px * 2, bh + px * 2, QColor(20, 24, 34))
+            # White base
+            painter.fillRect(bx, by, bw, bh, QColor(248, 250, 252))
+            # Classic cinema red vertical stripes
+            for sx in (1, 4, 7):
+                painter.fillRect(bx + px * sx, by, px * 2 - (1 if sx == 7 else 0), bh, QColor(235, 58, 68))
+            # Rim shadow
+            painter.fillRect(bx, by, bw, px, QColor(220, 226, 236))
+
+            # Fluffy golden popcorn pile on top
+            kernels = (
+                (0, -2, QColor(255, 240, 145)),
+                (2, -3, QColor(255, 224, 92)),
+                (4, -2, QColor(255, 248, 185)),
+                (6, -3, QColor(255, 218, 82)),
+                (7, -1, QColor(255, 236, 130)),
+            )
+            for kx, ky, col in kernels:
+                painter.fillRect(bx + px * kx, by + px * ky, px * 2, px * 2, col)
+
+            # Animated munching kernel tossing toward pet's mouth!
+            munch_cycle = (phase * 0.55) % 1.0
+            if munch_cycle < 0.65:
+                arc = math.sin((munch_cycle / 0.65) * math.pi)
+                mx = int(w * 0.50 - px + math.sin(phase * 1.3) * px)
+                my = int(by - px * 3 - arc * px * 5)
+                painter.fillRect(mx - 1, my - 1, px * 2 + 2, px * 2 + 2, QColor(28, 24, 18))
+                painter.fillRect(mx, my, px * 2, px * 2, QColor(255, 236, 110))
+            # Subtle tiny screen-glow reflection in pet's eyes while watching video
+            glow_a = int(120 + 60 * math.sin(phase * 1.8))
+            painter.fillRect(px * 11, px * 12, px, px, QColor(145, 235, 255, glow_a))
+            painter.fillRect(w - px * 12, px * 12, px, px, QColor(145, 235, 255, glow_a))
+
+        elif prop == "headphones":
+            # Neon pixel headphones band over head + earcups + floating musical notes
+            bob = int(round(math.sin(phase * 2.2) * px * 0.6))
+            band_col = QColor(42, 48, 66)
+            neon = QColor(52, 235, 168)
+            top_y = px * 4 + bob
+            painter.fillRect(px * 7, top_y, w - px * 14, px * 2, band_col)
+            painter.fillRect(px * 9, top_y, w - px * 18, px, neon)
+            # Left & right earcups
+            cup_y = px * 9 + bob
+            painter.fillRect(px * 4, cup_y, px * 3, px * 6, band_col)
+            painter.fillRect(px * 5, cup_y + px, px, px * 4, neon)
+            painter.fillRect(w - px * 7, cup_y, px * 3, px * 6, band_col)
+            painter.fillRect(w - px * 6, cup_y + px, px, px * 4, neon)
+            # Floating notes
+            font = QFont("Consolas", max(9, int(px * 2.6)), QFont.Weight.Bold)
+            painter.setFont(font)
+            for i, sym in enumerate(("♪", "♫")):
+                t = (phase * 0.35 + i * 0.5) % 1.0
+                nx = int(w * (0.22 if i == 0 else 0.74) + math.sin(phase + i * 2.0) * px * 2)
+                ny = int(px * 8 - t * px * 7)
+                alpha = max(60, min(255, int((1.0 - t) * 255)))
+                painter.setPen(QColor(102, 252, 241, alpha) if i == 0 else QColor(255, 214, 70, alpha))
+                painter.drawText(nx, ny, sym)
+
+        elif prop == "coffee":
+            # Smart coder pixel glasses + steaming coffee mug
+            frame = QColor(26, 32, 48)
+            lens = QColor(96, 200, 255, 130)
+            gy = px * 11
+            painter.fillRect(px * 8, gy, px * 6, px * 4, frame)
+            painter.fillRect(w - px * 14, gy, px * 6, px * 4, frame)
+            painter.fillRect(px * 14, gy + px, w - px * 28, px, frame)
+            painter.fillRect(px * 9, gy + px, px * 4, px * 2, lens)
+            painter.fillRect(w - px * 13, gy + px, px * 4, px * 2, lens)
+            # Steaming mug on bottom-right
+            mx = w - px * 10
+            my = int(h * 0.62)
+            painter.fillRect(mx - 1, my - 1, px * 6 + 2, px * 6 + 2, QColor(22, 24, 34))
+            painter.fillRect(mx, my, px * 6, px * 6, QColor(245, 240, 232))
+            painter.fillRect(mx + px, my + px, px * 4, px, QColor(115, 68, 38))
+            painter.fillRect(mx + px * 6, my + px, px * 2, px * 4, QColor(245, 240, 232))
+            painter.fillRect(mx + px * 6, my + px * 2, px, px * 2, QColor(22, 24, 34))
+            # Rising steam pixels
+            for i in range(2):
+                st = (phase * 0.4 + i * 0.5) % 1.0
+                sy = int(my - px * 2 - st * px * 5)
+                sx = int(mx + px * (1 + i * 3) + math.sin(phase * 1.5 + i) * px)
+                painter.fillRect(sx, sy, px, px * 2, QColor(235, 245, 255, int((1.0 - st) * 210)))
+
+        elif prop == "gamepad":
+            # Pixel retro controller in front with blinking ABXY buttons!
+            gx = int(w * 0.50 - px * 6)
+            gy = int(h * 0.60)
+            gw = px * 12
+            gh = px * 6
+            painter.fillRect(gx - px, gy - px, gw + px * 2, gh + px * 2, QColor(16, 20, 30))
+            painter.fillRect(gx, gy, gw, gh, QColor(48, 56, 78))
+            # D-pad (left)
+            painter.fillRect(gx + px * 2, gy + px, px, px * 3, QColor(205, 214, 230))
+            painter.fillRect(gx + px, gy + px * 2, px * 3, px, QColor(205, 214, 230))
+            # Blinking colored buttons (right)
+            blink = int(phase * 3.0) % 2 == 0
+            painter.fillRect(gx + px * 8, gy + px * 2, px, px, QColor(52, 235, 138) if blink else QColor(34, 150, 90))
+            painter.fillRect(gx + px * 10, gy + px * 2, px, px, QColor(255, 82, 108) if not blink else QColor(170, 50, 68))
+            painter.fillRect(gx + px * 9, gy + px, px, px, QColor(255, 214, 51))
+            painter.fillRect(gx + px * 9, gy + px * 3, px, px, QColor(56, 189, 248))
+
+        elif prop == "idea":
+            # Glowing golden pixel lightbulb above head
+            pulse = 0.6 + 0.4 * math.sin(phase * 2.4)
+            lx = int(w * 0.50 - px * 2)
+            ly = px * 2
+            glow = QColor(255, 232, 92, int(200 + 55 * pulse))
+            painter.fillRect(lx, ly, px * 4, px * 4, glow)
+            painter.fillRect(lx + px, ly + px * 4, px * 2, px * 2, QColor(160, 174, 192))
+            # Rays
+            if pulse > 0.5:
+                ray = QColor(255, 245, 150, 220)
+                painter.fillRect(lx - px * 2, ly + px, px, px, ray)
+                painter.fillRect(lx + px * 5, ly + px, px, px, ray)
+                painter.fillRect(lx + px, ly - px * 2, px * 2, px, ray)
+
+        elif prop == "chat":
+            # Mini pixel chat bubble with animated typing dots
+            cx = w - px * 10
+            cy = px * 2
+            painter.fillRect(cx - 1, cy - 1, px * 8 + 2, px * 5 + 2, QColor(20, 26, 40))
+            painter.fillRect(cx, cy, px * 8, px * 5, QColor(240, 248, 255))
+            active_dot = int(phase * 2.2) % 3
+            for i in range(3):
+                col = QColor(56, 189, 248) if i == active_dot else QColor(148, 163, 184)
+                painter.fillRect(cx + px * (1 + i * 2), cy + px * 2, px, px, col)
+
+        elif prop == "book":
+            # Open pixel book in front
+            bx = int(w * 0.50 - px * 6)
+            by = int(h * 0.62)
+            painter.fillRect(bx - px, by - px, px * 14, px * 7, QColor(36, 48, 72))
+            painter.fillRect(bx, by, px * 5, px * 5, QColor(250, 248, 235))
+            painter.fillRect(bx + px * 7, by, px * 5, px * 5, QColor(250, 248, 235))
+            painter.fillRect(bx + px * 5, by, px * 2, px * 5, QColor(148, 163, 184))
+            for ly in (1, 3):
+                painter.fillRect(bx + px, by + px * ly, px * 3, max(1, px // 2), QColor(100, 116, 139))
+                painter.fillRect(bx + px * 8, by + px * ly, px * 3, max(1, px // 2), QColor(100, 116, 139))
+
+        elif prop == "sparkle":
+            # Twinkling golden shopping stars around the pet
+            for i in range(4):
+                ang = phase * 0.9 + i * (math.pi / 2.0)
+                sx = int(w * 0.5 + math.cos(ang) * w * 0.36)
+                sy = int(px * 6 + math.sin(ang) * px * 3.0)
+                col = QColor(255, 214, 51) if i % 2 == 0 else QColor(255, 118, 178)
+                painter.fillRect(sx - px, sy, px * 2 + 1, px, col)
+                painter.fillRect(sx, sy - px, px, px * 2 + 1, col)
 
     def _paint_pixel_emotion_fx(self, painter: QPainter) -> None:
         w = self.width()
@@ -282,6 +488,8 @@ class TransparentPetWindow(QWidget):
             self.drag_moved.emit(target_x, target_y)
             event.accept()
         else:
+            pos = event.position()
+            self.pet_hovered.emit(float(pos.x()), float(pos.y()))
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -307,9 +515,66 @@ class TransparentPetWindow(QWidget):
         handoff_action.triggered.connect(self.request_handoff.emit)
         menu.addAction(handoff_action)
 
-        love_action = QAction("Pet with Love ♥", menu)
+        love_action = QAction("Погладить ♥ (Pet with Love)", menu)
         love_action.triggered.connect(self.request_pet_love.emit)
         menu.addAction(love_action)
+
+        # ---- Play & Games submenu ----
+        games_menu = menu.addMenu("🎮 Игры с Чубриком")
+        ball_lbl = "⚽ Убрать мячик" if self._ball_active else "⚽ Бросить мячик (Апорт!)"
+        act_ball = QAction(ball_lbl, games_menu)
+        act_ball.triggered.connect(self.request_play_ball.emit)
+        games_menu.addAction(act_ball)
+
+        act_snack = QAction("🍪 Бросить вкусняшку", games_menu)
+        act_snack.triggered.connect(self.request_drop_snack.emit)
+        games_menu.addAction(act_snack)
+
+        laser_lbl = "🔴 Выключить лазер" if self._laser_active else "🔴 Лазерная указка (Погоня!)"
+        act_laser = QAction(laser_lbl, games_menu)
+        act_laser.triggered.connect(self.request_toggle_laser.emit)
+        games_menu.addAction(act_laser)
+
+        balloon_lbl = "🎈 Стоп: Лопать шарики" if self._balloons_active else "🎈 Лопать шарики (25 сек)"
+        act_balloons = QAction(balloon_lbl, games_menu)
+        act_balloons.triggered.connect(self.request_start_balloons.emit)
+        games_menu.addAction(act_balloons)
+
+        act_dance = QAction("💃 Станцевать!", games_menu)
+        act_dance.triggered.connect(self.request_dance.emit)
+        games_menu.addAction(act_dance)
+
+        # ---- Website Reactions submenu ----
+        site_menu = menu.addMenu("🌐 Реакции на сайты")
+        act_site_toggle = QAction("Реагировать на открытые сайты", site_menu)
+        act_site_toggle.setCheckable(True)
+        act_site_toggle.setChecked(self._site_reactions_enabled)
+        act_site_toggle.triggered.connect(self.request_toggle_site_reactions.emit)
+        site_menu.addAction(act_site_toggle)
+        site_menu.addSeparator()
+        for act_id, lbl in (
+            ("video_popcorn", "🍿 Тест: YouTube (Попкорн)"),
+            ("music_headphones", "🎧 Тест: Музыка (Наушники)"),
+            ("coding_coffee", "☕ Тест: Код (Очки и кофе)"),
+            ("gaming_gamepad", "🎮 Тест: Игры (Геймпад)"),
+            ("ai_idea", "💡 Тест: Идея (Лампочка)"),
+            ("none", "✖ Убрать пропс"),
+        ):
+            a_prev = QAction(lbl, site_menu)
+            a_prev.triggered.connect(lambda _c=False, a=act_id: self.request_preview_site_prop.emit(a))
+            site_menu.addAction(a_prev)
+
+        act_profile = QAction("⭐ Профиль и настроение Чубрика", menu)
+        act_profile.triggered.connect(self.request_show_profile.emit)
+        menu.addAction(act_profile)
+
+        act_break = QAction("💧 Напоминание размяться (45 мин)", menu)
+        act_break.setCheckable(True)
+        act_break.setChecked(self._break_reminder_enabled)
+        act_break.triggered.connect(self.request_toggle_break_reminder.emit)
+        menu.addAction(act_break)
+
+        menu.addSeparator()
 
         emo_menu = menu.addMenu("Emotion & Color")
         for emo_id, emo_label in (
