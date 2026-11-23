@@ -1,0 +1,147 @@
+name: Build HandMouse PC Control EXE
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "hand_mouse/**"
+      - "build_exe_handmouse/**"
+      - "tests/test_hand_mouse.py"
+      - ".github/workflows/build-hand-mouse-exe.yml"
+  pull_request:
+    paths:
+      - "hand_mouse/**"
+      - "build_exe_handmouse/**"
+      - "tests/test_hand_mouse.py"
+      - ".github/workflows/build-hand-mouse-exe.yml"
+  workflow_dispatch:
+
+jobs:
+  build-hand-mouse-exe:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies and PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Run HandMouse test suite on Windows
+        shell: pwsh
+        run: |
+          pytest -v tests/test_hand_mouse.py *>&1 | Tee-Object -FilePath pytest_handmouse.log
+          if ($LASTEXITCODE -ne 0) {
+            $err = (Get-Content pytest_handmouse.log -Tail 30) -join " | "
+            if ($err.Length -gt 1200) { $err = $err.Substring($err.Length - 1200) }
+            Write-Output "::error title=Windows Pytest Failure::$err"
+            exit 1
+          }
+
+      - name: Download offline MediaPipe HandLandmarker model
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "assets\models" | Out-Null
+          $model = "assets\models\hand_landmarker.task"
+          $urls = @(
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+          )
+          $downloaded = $false
+          foreach ($url in $urls) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $model -UseBasicParsing
+              if ((Get-Item $model).Length -gt 1000000) {
+                $downloaded = $true
+                break
+              }
+            } catch {
+              Write-Warning "Failed to download from $url : $_"
+            }
+          }
+          if (-not $downloaded) {
+            Write-Output "::error title=Model Download Error::Could not download hand_landmarker.task"
+            exit 1
+          }
+          Get-Item $model | Select-Object Name, Length
+
+      - name: Generate Windows targeting reticle icon
+        shell: pwsh
+        run: python build_exe_handmouse\generate_icon.py
+
+      - name: Build standalone HandMouse-PC-Control-Windows.exe with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller --clean --noconfirm build_exe_handmouse\hand_mouse.spec *>&1 | Tee-Object -FilePath pyinstaller_handmouse.log
+          if ($LASTEXITCODE -ne 0) {
+            $err = (Get-Content pyinstaller_handmouse.log -Tail 30) -join " | "
+            if ($err.Length -gt 1200) { $err = $err.Substring($err.Length - 1200) }
+            Write-Output "::error title=PyInstaller Build Failure::$err"
+            exit 1
+          }
+          $exe = Get-Item "dist\HandMouse-PC-Control-Windows.exe"
+          Write-Host ("Built {0} ({1:N1} MB)" -f $exe.FullName, ($exe.Length / 1MB))
+
+      - name: Smoke-test frozen HandMouse-PC-Control-Windows.exe (--self-test)
+        shell: pwsh
+        run: |
+          $logFile = Join-Path $PWD "self_test_handmouse.txt"
+          if (Test-Path $logFile) { Remove-Item $logFile -Force }
+          $proc = Start-Process -FilePath "dist\HandMouse-PC-Control-Windows.exe" `
+            -ArgumentList "--self-test", "--self-test-log", $logFile `
+            -Wait -PassThru
+          if ($proc.ExitCode -ne 0 -or -not (Test-Path $logFile)) {
+            $errLog = Join-Path $env:APPDATA "HandMouse-PC-Control\handmouse_error.log"
+            $details = "ExitCode=$($proc.ExitCode)"
+            if (Test-Path $logFile) {
+              $details += " | " + ((Get-Content $logFile -Tail 20) -join " ")
+            }
+            if (Test-Path $errLog) {
+              $details += " | " + ((Get-Content $errLog -Tail 25) -join " ")
+            }
+            if ($details.Length -gt 1200) { $details = $details.Substring(0, 1200) }
+            Write-Output "::error title=EXE Self-Test Failed::$details"
+            exit 1
+          }
+          Get-Content $logFile
+
+      - name: Upload HandMouse-PC-Control-Windows.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HandMouse-PC-Control-Windows-EXE
+          path: dist/HandMouse-PC-Control-Windows.exe
+          if-no-files-found: error
+
+      - name: Publish direct-download EXE to GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $exe = "dist\HandMouse-PC-Control-Windows.exe"
+          $tag = "hand-mouse-exe-latest"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $exe --clobber
+          } else {
+            gh release create $tag $exe `
+              --target "$env:GITHUB_SHA" `
+              --prerelease `
+              --title "HandMouse PC Control — Anti-Misclick Gesture Control (.exe)" `
+              --notes "Standalone Windows .exe (no Python required): control your Windows PC with hand gestures using the exact 21-landmark MediaPipe + OpenCV hand tracking engine from GCS Shimeji, featuring an always-on-top click-through targeting reticle showing exactly where your click will land, Pre-Pinch Target Freeze Lock, LMB/Double-Click/Drag/RMB/Scroll/Clutch gestures, physical mouse yield, and F8 global pause."
+          }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error title=Release Upload Failed::gh release command exited with $LASTEXITCODE"
+            exit 1
+          }
