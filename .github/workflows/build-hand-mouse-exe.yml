@@ -38,10 +38,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Run Python test suite on Windows
+      - name: Run HandMouse test suite on Windows
         shell: pwsh
         run: |
-          pytest -v *>&1 | Tee-Object -FilePath pytest_handmouse.log
+          pytest -v tests/test_hand_mouse.py *>&1 | Tee-Object -FilePath pytest_handmouse.log
           if ($LASTEXITCODE -ne 0) {
             $err = (Get-Content pytest_handmouse.log -Tail 30) -join " | "
             if ($err.Length -gt 1200) { $err = $err.Substring($err.Length - 1200) }

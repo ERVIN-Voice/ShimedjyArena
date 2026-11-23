@@ -127,6 +127,38 @@ def _run_self_test(log_path: str = "") -> int:
         assert s2.last_click is not None and s2.last_click.kind == "left"
         lines.append(f"OK anti-misclick lock verified at ({s2.target_x}, {s2.target_y})")
 
+        # Verify ThreadedCameraReader + GestureRecognizer + draw_hand_overlay end-to-end
+        from windows.camera import ThreadedCameraReader, create_camera
+        from windows.hand_detection import GestureRecognizer, draw_hand_overlay
+
+        syn_cam = create_camera("synthetic")
+        reader = ThreadedCameraReader(syn_cam, max_poll_hz=60.0)
+        assert reader.start()
+        try:
+            frame = None
+            import time as _time
+
+            for _ in range(30):
+                frame, _ = reader.get_latest(0)
+                if frame is not None:
+                    break
+                _time.sleep(0.01)
+            assert frame is not None
+            rec = GestureRecognizer(detector=detector, hold_frames=1)
+            ev = rec.process_frame(frame)
+            st = ctrl.update(ev, now=2.0)
+            canvas = draw_hand_overlay(
+                frame.frame_bgr,
+                ev,
+                active_action=f"{st.mode.value.upper()} ({st.target_x}, {st.target_y})",
+                fps=reader.fps,
+                control_zone_norm=cfg.active_zone_rect(),
+            )
+            assert canvas is not None and canvas.size > 0
+            lines.append("OK ThreadedCameraReader + GestureRecognizer + overlay verified")
+        finally:
+            reader.stop()
+
         # Verify GUI modules & actual widget instantiation on Windows desktop
         from hand_mouse import control_panel, target_overlay  # noqa: F401
 

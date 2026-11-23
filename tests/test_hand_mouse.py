@@ -219,3 +219,28 @@ def test_cli_parse_args_and_icon_generation(tmp_path: Path) -> None:
 
     ico = generate_icon(tmp_path / "test_reticle.ico")
     assert ico.exists() and ico.stat().st_size > 1000
+
+
+def test_threaded_camera_reader_end_to_end_with_hand_mouse() -> None:
+    import time
+    from windows.camera import ThreadedCameraReader, create_camera
+    from windows.hand_detection import GestureRecognizer, OpenCVHandDetector
+
+    cam = create_camera("synthetic")
+    reader = ThreadedCameraReader(cam, max_poll_hz=60.0)
+    assert reader.start() is True
+    try:
+        frame = None
+        for _ in range(40):
+            frame, _ = reader.get_latest(0)
+            if frame is not None:
+                break
+            time.sleep(0.01)
+        assert frame is not None
+        rec = GestureRecognizer(detector=OpenCVHandDetector(), hold_frames=1)
+        ctrl = HandMouseController(VirtualPointerBackend(ScreenBounds(0, 0, 1920, 1080)))
+        ev = rec.process_frame(frame)
+        st = ctrl.update(ev, now=1.0)
+        assert st.target_x >= 0 and st.target_y >= 0
+    finally:
+        reader.stop()

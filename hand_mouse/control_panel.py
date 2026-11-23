@@ -537,7 +537,7 @@ class HandMouseMainWindow(QtWidgets.QWidget):
         self._last_frame_seq = 0
         try:
             cam = create_camera(kind, device_index=index)
-            reader = ThreadedCameraReader(cam, target_fps=60.0)
+            reader = ThreadedCameraReader(cam, max_poll_hz=60.0)
             if reader.start():
                 self._reader = reader
                 self._status_label.setText(
@@ -596,9 +596,9 @@ class HandMouseMainWindow(QtWidgets.QWidget):
         event,
         state: HandMouseFrameState,
     ) -> None:
-        action_text = f"{state.mode.value.upper()} ({state.target_x}, {state.target_y})"
-        if state.pending_action:
-            action_text = f"{state.pending_action} [{state.target_x},{state.target_y}]"
+        mode_tag = state.mode.value.upper()
+        lock_tag = " [LOCKED]" if state.target_locked else ""
+        action_text = f"{mode_tag}{lock_tag} ({state.target_x}, {state.target_y})"
         canvas = draw_hand_overlay(
             frame.frame_bgr,
             event,
