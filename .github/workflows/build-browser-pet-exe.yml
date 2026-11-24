@@ -1,0 +1,120 @@
+name: Build Browser Shimeji Server EXE
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "browser_pet/**"
+      - "build_exe_browser_pet/**"
+      - "tests/test_browser_pet.py"
+      - ".github/workflows/build-browser-pet-exe.yml"
+  pull_request:
+    paths:
+      - "browser_pet/**"
+      - "build_exe_browser_pet/**"
+      - "tests/test_browser_pet.py"
+      - ".github/workflows/build-browser-pet-exe.yml"
+  workflow_dispatch:
+
+jobs:
+  build-browser-pet-exe:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install lightweight dependencies and PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install "PySide6>=6.7.0" "websockets>=13.0" "Pillow>=10.3.0" "qrcode>=7.4.2" "pytest>=8.2.0" "pytest-asyncio>=0.23.7" pyinstaller
+
+      - name: Run Browser Shimeji test suite on Windows
+        shell: pwsh
+        run: |
+          pytest -v tests/test_browser_pet.py *>&1 | Tee-Object -FilePath pytest_browser_pet.log
+          if ($LASTEXITCODE -ne 0) {
+            $err = (Get-Content pytest_browser_pet.log -Tail 30) -join " | "
+            if ($err.Length -gt 1200) { $err = $err.Substring($err.Length - 1200) }
+            Write-Output "::error title=Windows Pytest Failure::$err"
+            exit 1
+          }
+
+      - name: Generate Windows icon
+        shell: pwsh
+        run: python build_exe_browser_pet\generate_icon.py
+
+      - name: Build standalone Shimeji-Browser-Server-Windows.exe with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller --clean --noconfirm build_exe_browser_pet\browser_pet.spec *>&1 | Tee-Object -FilePath pyinstaller_browser_pet.log
+          if ($LASTEXITCODE -ne 0) {
+            $err = (Get-Content pyinstaller_browser_pet.log -Tail 30) -join " | "
+            if ($err.Length -gt 1200) { $err = $err.Substring($err.Length - 1200) }
+            Write-Output "::error title=PyInstaller Build Failure::$err"
+            exit 1
+          }
+          $exe = Get-Item "dist\Shimeji-Browser-Server-Windows.exe"
+          Write-Host ("Built {0} ({1:N1} MB)" -f $exe.FullName, ($exe.Length / 1MB))
+
+      - name: Smoke-test frozen Shimeji-Browser-Server-Windows.exe (--self-test)
+        shell: pwsh
+        run: |
+          $logFile = Join-Path $PWD "self_test_browser_pet.txt"
+          if (Test-Path $logFile) { Remove-Item $logFile -Force }
+          $proc = Start-Process -FilePath "dist\Shimeji-Browser-Server-Windows.exe" `
+            -ArgumentList "--self-test", "--self-test-log", $logFile `
+            -Wait -PassThru
+          if ($proc.ExitCode -ne 0 -or -not (Test-Path $logFile)) {
+            $errLog = Join-Path $env:APPDATA "Shimeji-Browser-Server\browser_pet_error.log"
+            $details = "ExitCode=$($proc.ExitCode)"
+            if (Test-Path $logFile) {
+              $details += " | " + ((Get-Content $logFile -Tail 20) -join " ")
+            }
+            if (Test-Path $errLog) {
+              $details += " | " + ((Get-Content $errLog -Tail 25) -join " ")
+            }
+            if ($details.Length -gt 1200) { $details = $details.Substring(0, 1200) }
+            Write-Output "::error title=EXE Self-Test Failed::$details"
+            exit 1
+          }
+          Get-Content $logFile
+
+      - name: Upload Shimeji-Browser-Server-Windows.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shimeji-Browser-Server-Windows-EXE
+          path: dist/Shimeji-Browser-Server-Windows.exe
+          if-no-files-found: error
+
+      - name: Publish direct-download EXE to GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $exe = "dist\Shimeji-Browser-Server-Windows.exe"
+          $tag = "browser-pet-exe-latest"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $exe --clobber
+          } else {
+            gh release create $tag $exe `
+              --target "$env:GITHUB_SHA" `
+              --prerelease `
+              --title "Shimeji Browser Server — Throw Pixel Pet Between Tabs & PCs (.exe)" `
+              --notes "Standalone Windows .exe server (no Python required): run on one PC, open the LAN link or QR in any browser tab on this PC, other PCs, or phones, and throw your pixel Shimeji (and bouncy balls or postal notes!) directly across screen edges between tabs and PCs."
+          }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error title=Release Upload Failed::gh release command exited with $LASTEXITCODE"
+            exit 1
+          }

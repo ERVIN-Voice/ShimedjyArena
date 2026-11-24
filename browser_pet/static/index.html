@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Чубрик — Браузерные порталы между ПК</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body class="theme-space">
+  <!-- Top compact portal bar -->
+  <header id="topbar" class="topbar">
+    <div class="topbar-left">
+      <span id="connDot" class="conn-dot offline" title="Статус подключения"></span>
+      <input id="tabNameInput" class="tab-name-input" type="text" maxlength="36" placeholder="Имя этой вкладки / ПК" title="Нажмите, чтобы переименовать эту вкладку (Enter)" />
+      <span id="throwsBadge" class="stat-pill" title="Всего перебросов между вкладками">🚀 0</span>
+    </div>
+
+    <div id="tabsRibbon" class="tabs-ribbon" title="Порядок экранов в ленте порталов. Перетащите Чубрика на любую карточку, чтобы кинуть туда!"></div>
+
+    <div class="topbar-right">
+      <button id="toggleHudBtn" class="icon-btn" title="Свернуть / развернуть нижнюю панель">🎛️</button>
+      <button id="soundBtn" class="icon-btn" title="8-bit звуки (вкл/выкл)">🔊</button>
+      <button id="fullscreenBtn" class="icon-btn" title="На весь экран (F11)">⛶</button>
+    </div>
+  </header>
+
+  <!-- Main full-window interactive canvas stage -->
+  <main id="stage" class="stage">
+    <!-- Left & Right Neon Portals -->
+    <div id="portalLeft" class="edge-portal left hidden">
+      <div class="portal-glow"></div>
+      <div class="portal-tag">
+        <span class="portal-arrow">←</span>
+        <span id="portalLeftName" class="portal-name">Сосед слева</span>
+      </div>
+    </div>
+
+    <div id="portalRight" class="edge-portal right hidden">
+      <div class="portal-glow"></div>
+      <div class="portal-tag">
+        <span id="portalRightName" class="portal-name">Сосед справа</span>
+        <span class="portal-arrow">→</span>
+      </div>
+    </div>
+
+    <!-- Pixel-art canvas -->
+    <canvas id="petCanvas"></canvas>
+
+    <!-- Waiting radar when all pets are currently on other tabs/PCs -->
+    <div id="radarOverlay" class="radar-overlay hidden">
+      <div class="radar-card">
+        <div class="radar-icon">🌀</div>
+        <h2 id="radarTitle">Чубрик сейчас на другом экране</h2>
+        <p id="radarDesc">Швырните его за край экрана на том ПК — он вылетит прямо сюда!</p>
+        <div class="radar-actions">
+          <button id="summonBtn" class="btn primary">📣 Позвать Чубрика сюда</button>
+          <button id="radarSpawnBtn" class="btn">➕ Добавить ещё Чубрика</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast notifications -->
+    <div id="toast" class="toast hidden"></div>
+  </main>
+
+  <!-- Bottom interactive toolbar -->
+  <footer id="dock" class="dock">
+    <div class="dock-group">
+      <button id="ballBtn" class="btn" title="Кинуть мячик (его тоже можно швырнуть за край на другой ПК!)">⚽ Мячик</button>
+      <button id="snackBtn" class="btn" title="Кинуть вкусняшку Чубрику">🍪 Вкусняшка</button>
+      <button id="jumpBtn" class="btn" title="Подпрыгнуть">⬆️ Прыг</button>
+      <button id="spawnBtn" class="btn" title="Добавить ещё одного Чубрика (до 8)">➕ Чубрик</button>
+      <button id="wanderBtn" class="btn toggle" title="Чубрик сам гуляет между открытыми вкладками и ПК">🌀 Авто-прогулка</button>
+    </div>
+
+    <div class="dock-group emotions" id="emotionBar" title="Эмоция и цвет Чубрика">
+      <button class="emo-btn active" data-emo="neutral" title="Обычный (Голубой)">🙂</button>
+      <button class="emo-btn" data-emo="happy" title="Радость (Жёлтый)">😊</button>
+      <button class="emo-btn" data-emo="love" title="Любовь (Розовый)">💕</button>
+      <button class="emo-btn" data-emo="excited" title="Восторг (Зелёный)">🤩</button>
+      <button class="emo-btn" data-emo="dizzy" title="Головокружение (Фиолетовый)">😵</button>
+      <button class="emo-btn" data-emo="angry" title="Злость (Красный)">😠</button>
+      <button class="emo-btn" data-emo="sleepy" title="Сонный (Сиреневый)">😴</button>
+    </div>
+
+    <div class="dock-group">
+      <input id="noteInput" class="note-input" type="text" maxlength="90" placeholder="💌 Записка при броске на другой ПК..." />
+      <select id="themeSelect" class="theme-select" title="Фон комнаты">
+        <option value="theme-space">🌌 Космос</option>
+        <option value="theme-desk">🪵 Уютный стол</option>
+        <option value="theme-light">☀️ Светлый</option>
+        <option value="theme-chroma">🟩 Зелёный экран (OBS)</option>
+      </select>
+    </div>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
