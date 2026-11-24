@@ -309,14 +309,23 @@ def test_gesture_pet_controller_real_time_interactions(tmp_path: Path) -> None:
 
         # 3) POINT on the far left calls pet to walk/run left
         cam.set_scene("point", hand_nx=0.20, hand_ny=0.55)
-        for _ in range(3):
-            ctrl.process_frame(cam.read())  # type: ignore[arg-type]
+        t_pt = time.time() + 1.0
+        for step in range(4):
+            raw = cam.read()
+            assert raw is not None
+            stamped = CameraFrame(
+                frame_bgr=raw.frame_bgr,
+                timestamp=t_pt + step * 0.05,
+                frame_index=raw.frame_index,
+                source_kind=raw.source_kind,
+            )
+            ctrl.process_frame(stamped)
         assert engine.animation in ("walk", "run")
         assert engine.facing == "left"
 
         # 4) Sustained FIST puts pet to sleep
         cam.set_scene("fist", hand_nx=0.50, hand_ny=0.60)
-        t0 = time.time()
+        t0 = t_pt + 1.0
         for step in range(5):
             raw = cam.read()
             assert raw is not None

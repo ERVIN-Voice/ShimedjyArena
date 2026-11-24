@@ -10,12 +10,14 @@ Connects:
 from __future__ import annotations
 
 import logging
+import math
+import random
 import time
 from pathlib import Path
 from typing import Any, Literal
 
 from PySide6.QtCore import QObject, Qt, QTimer
-from PySide6.QtGui import QAction, QIcon, QPixmap
+from PySide6.QtGui import QAction, QCursor, QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMenu, QMessageBox, QSystemTrayIcon, QVBoxLayout
 
 from server.hub import build_pairing_uri, detect_local_ip, render_pairing_qr_ascii, save_pairing_qr_png
@@ -33,6 +35,27 @@ from windows.hand_detection import (
 )
 from windows.network_client import EmbeddedHubRunner, HubClientEvent, WindowsHubClient
 from windows.pet_engine import EdgeHandoffEvent, PetEngine
+from windows.pet_profile import PetProfile
+from windows.site_reactor import (
+    SiteActivity,
+    SiteReactor,
+    detect_foreground_window_title,
+)
+from windows.toy_physics import (
+    SNACK_KINDS,
+    BalloonPopGame,
+    FetchBallState,
+    PettingStrokeDetector,
+    SnackDropState,
+)
+from windows.toy_windows import (
+    BalloonToyWindow,
+    BallToyWindow,
+    LaserDotWindow,
+    PetStatusDialog,
+    PetThoughtBubble,
+    SnackToyWindow,
+)
 from windows.transparent_window import (
     HandoffPromptOverlay,
     TransparentPetWindow,
@@ -128,6 +151,7 @@ class DesktopPetApp(QObject):
         self._window.drag_moved.connect(self._engine.update_drag)
         self._window.drag_ended.connect(self._on_drag_ended)
         self._window.double_clicked.connect(self._engine.trigger_jump)
+        self._window.pet_hovered.connect(self._on_pet_hovered)
         self._window.request_handoff.connect(self._trigger_manual_handoff)
         self._window.request_scale_delta.connect(self._adjust_scale)
         self._window.request_toggle_sleep.connect(self._toggle_sleep)
@@ -136,7 +160,42 @@ class DesktopPetApp(QObject):
         self._window.request_show_pairing.connect(self.show_pairing_dialog)
         self._window.request_toggle_camera_hud.connect(self.toggle_camera_preview)
         self._window.request_enable_camera.connect(self._enable_camera_runtime)
+        self._window.request_play_ball.connect(self._toggle_fetch_ball)
+        self._window.request_drop_snack.connect(self._drop_snack)
+        self._window.request_toggle_laser.connect(self._toggle_laser_chase)
+        self._window.request_start_balloons.connect(self._toggle_balloon_game)
+        self._window.request_dance.connect(self._start_dance)
+        self._window.request_toggle_site_reactions.connect(self._toggle_site_reactions)
+        self._window.request_preview_site_prop.connect(self._preview_site_prop)
+        self._window.request_show_profile.connect(self._show_pet_profile)
+        self._window.request_toggle_break_reminder.connect(self._toggle_break_reminder)
         self._window.request_quit.connect(self.shutdown)
+
+        # Website reactions, cozy companion profile, thought bubble & interactive desktop games
+        self._fun_rng = random.Random()
+        self._site_reactor = SiteReactor(enabled=True, debounce_polls=2, quip_interval_sec=28.0)
+        self._last_site_poll: float = 0.0
+        self._active_prop: str = ""
+        self._profile = PetProfile.load()
+        self._petting_detector = PettingStrokeDetector()
+        self._thought_bubble = PetThoughtBubble()
+
+        self._ball_state: FetchBallState | None = None
+        self._ball_win: BallToyWindow | None = None
+        self._snack_state: SnackDropState | None = None
+        self._snack_win: SnackToyWindow | None = None
+        self._balloon_game = BalloonPopGame()
+        self._balloon_wins: dict[int, BalloonToyWindow] = {}
+        self._laser_active: bool = False
+        self._laser_win: LaserDotWindow | None = None
+        self._laser_catch_cd: float = 0.0
+        self._dance_steps_left: int = 0
+        self._dance_timer = QTimer(self)
+        self._dance_timer.setInterval(480)
+        self._dance_timer.timeout.connect(self._on_dance_step)
+
+        self._break_reminder_enabled: bool = False
+        self._last_break_reminder_t: float = time.monotonic()
 
         # Incoming handoff prompt overlay
         self._handoff_overlay = HandoffPromptOverlay(
@@ -242,6 +301,37 @@ class DesktopPetApp(QObject):
         tray.setToolTip("GCS Shimeji — Pixel Desktop Companion")
 
         menu = QMenu()
+        games_tray = menu.addMenu("🎮 Игры с Чубриком")
+        act_t_ball = QAction("⚽ Бросить / убрать мячик", games_tray)
+        act_t_ball.triggered.connect(self._toggle_fetch_ball)
+        games_tray.addAction(act_t_ball)
+
+        act_t_snack = QAction("🍪 Бросить вкусняшку", games_tray)
+        act_t_snack.triggered.connect(self._drop_snack)
+        games_tray.addAction(act_t_snack)
+
+        act_t_laser = QAction("🔴 Лазерная указка (Погоня)", games_tray)
+        act_t_laser.triggered.connect(self._toggle_laser_chase)
+        games_tray.addAction(act_t_laser)
+
+        act_t_balloons = QAction("🎈 Лопать шарики (25с)", games_tray)
+        act_t_balloons.triggered.connect(self._toggle_balloon_game)
+        games_tray.addAction(act_t_balloons)
+
+        act_t_dance = QAction("💃 Станцевать!", games_tray)
+        act_t_dance.triggered.connect(self._start_dance)
+        games_tray.addAction(act_t_dance)
+
+        act_t_prof = QAction("⭐ Профиль и настроение", menu)
+        act_t_prof.triggered.connect(self._show_pet_profile)
+        menu.addAction(act_t_prof)
+
+        act_t_sites = QAction("🌐 Вкл/Выкл реакции на сайты", menu)
+        act_t_sites.triggered.connect(self._toggle_site_reactions)
+        menu.addAction(act_t_sites)
+
+        menu.addSeparator()
+
         pair_action = QAction("Show Pairing QR / URL", menu)
         pair_action.triggered.connect(self.show_pairing_dialog)
         menu.addAction(pair_action)
@@ -484,7 +574,372 @@ class DesktopPetApp(QObject):
 
     def _pet_with_love(self) -> None:
         self._engine.pet_with_love()
+        leveled = self._profile.record_petting()
+        if leveled:
+            self._say(f"Ура! Уровень {self._profile.level}: {self._profile.title}! ★", emotion="love", duration_ms=4200)
+        else:
+            self._say(self._fun_rng.choice(("Мурр~ ♥", "Ещё погладь! ♥", "Обожаю тебя! ♥")), emotion="love", duration_ms=2600)
         self._push_state_to_hub(force=True)
+
+    # ------------------------------------------------------------------
+    # Website reactions, petting, cozy profile & interactive desktop games
+    # ------------------------------------------------------------------
+
+    def _say(self, text: str, *, emotion: str | None = None, duration_ms: int = 3600) -> None:
+        if not self._engine.is_visible or not self._engine.is_owner:
+            return
+        self._thought_bubble.show_message(
+            text,
+            emotion=emotion or self._engine.emotion,
+            duration_ms=duration_ms,
+        )
+        self._thought_bubble.follow_pet(self._engine.x, self._engine.y, self._engine.pet_width)
+
+    def _on_pet_hovered(self, local_x: float, local_y: float) -> None:
+        if self._engine.is_dragging or not self._engine.is_owner:
+            return
+        if self._petting_detector.feed(local_x, local_y, self._engine.pet_height, now=time.monotonic()):
+            self._pet_with_love()
+
+    def _toggle_site_reactions(self) -> None:
+        self._site_reactor.enabled = not self._site_reactor.enabled
+        if not self._site_reactor.enabled:
+            self._site_reactor.clear_manual_preview()
+            self._active_prop = ""
+            self._say("Реакции на сайты выключены", emotion="neutral", duration_ms=2400)
+        else:
+            self._say("Снова смотрю, на какие сайты ты заходишь! 👀", emotion="happy", duration_ms=3000)
+
+    def _preview_site_prop(self, activity_id: str) -> None:
+        try:
+            act = SiteActivity(activity_id)
+        except ValueError:
+            act = SiteActivity.NONE
+        upd = self._site_reactor.set_manual_preview(act, now=time.monotonic(), duration_sec=25.0)
+        if upd.reaction is None:
+            self._active_prop = ""
+            self._say("Убрал пропс!", emotion="neutral", duration_ms=2000)
+        else:
+            self._active_prop = upd.reaction.prop_name
+            if upd.reaction.prefer_sit:
+                self._engine.sit_and_watch(upd.reaction.emotion)
+            else:
+                self._engine.set_emotion(upd.reaction.emotion, duration_seconds=6.0)
+            if upd.new_phrase:
+                self._say(upd.new_phrase, emotion=upd.reaction.emotion, duration_ms=4200)
+
+    def _show_pet_profile(self) -> None:
+        cur = self._site_reactor.current_reaction
+        site_name = cur.site_label if cur is not None else "Просто гуляет"
+        dlg = PetStatusDialog(self._profile, active_site=site_name, parent=None)
+        dlg.exec()
+
+    def _toggle_break_reminder(self) -> None:
+        self._break_reminder_enabled = not self._break_reminder_enabled
+        self._last_break_reminder_t = time.monotonic()
+        if self._break_reminder_enabled:
+            self._say("Напомню попить воды через 45 мин! 💧", emotion="happy", duration_ms=3200)
+        else:
+            self._say("Напоминалка разминки выключена", emotion="neutral", duration_ms=2400)
+
+    def _has_active_game(self) -> bool:
+        return (
+            (self._ball_state is not None and self._ball_state.active)
+            or (self._snack_state is not None and self._snack_state.active)
+            or self._balloon_game.active
+            or self._laser_active
+            or self._dance_steps_left > 0
+        )
+
+    def _toggle_fetch_ball(self) -> None:
+        if self._ball_state is not None and self._ball_state.active:
+            self._close_fetch_ball()
+            self._say("Убрал мячик! Хорошо поиграли ⚽", emotion="happy", duration_ms=2600)
+            return
+        if self._engine.state == "SLEEPING":
+            self._engine.wake_up()
+        screen = self._engine.bounds.screen_for_point(
+            self._engine.x + self._engine.pet_width / 2.0,
+            self._engine.y + self._engine.pet_height / 2.0,
+        )
+        start_x = min(screen.right - 60.0, max(screen.left + 60.0, self._engine.x + self._fun_rng.choice((-260.0, 260.0))))
+        start_y = max(screen.top + 80.0, screen.bottom - 340.0)
+        self._ball_state = FetchBallState(
+            x=start_x,
+            y=start_y,
+            vx=self._fun_rng.choice((-240.0, 240.0)),
+            vy=-180.0,
+            radius=18.0,
+        )
+        win = BallToyWindow(radius=18)
+        win.drag_started.connect(self._on_ball_drag_started)
+        win.drag_moved.connect(self._on_ball_drag_moved)
+        win.drag_ended.connect(self._on_ball_drag_ended)
+        win.request_close.connect(self._close_fetch_ball)
+        win.sync_position(start_x, start_y, 0.0)
+        win.show()
+        self._ball_win = win
+        self._say("Ура, мячик! Кидай его мышкой, я поймаю! ⚽", emotion="excited", duration_ms=3600)
+
+    def _on_ball_drag_started(self, x: float, y: float) -> None:
+        if self._ball_state is not None:
+            self._ball_state.start_drag(x, y, time.monotonic())
+
+    def _on_ball_drag_moved(self, x: float, y: float) -> None:
+        if self._ball_state is not None:
+            self._ball_state.update_drag(x, y, time.monotonic())
+
+    def _on_ball_drag_ended(self) -> None:
+        if self._ball_state is not None:
+            self._ball_state.release_drag()
+
+    def _close_fetch_ball(self) -> None:
+        self._ball_state = None
+        if self._ball_win is not None:
+            self._ball_win.hide()
+            self._ball_win.close()
+            self._ball_win.deleteLater()
+            self._ball_win = None
+
+    def _drop_snack(self) -> None:
+        if self._engine.state == "SLEEPING":
+            self._engine.wake_up()
+        self._close_snack()
+        screen = self._engine.bounds.screen_for_point(
+            self._engine.x + self._engine.pet_width / 2.0,
+            self._engine.y + self._engine.pet_height / 2.0,
+        )
+        kind = self._fun_rng.choice(SNACK_KINDS)
+        sx = min(screen.right - 70.0, max(screen.left + 70.0, self._engine.x + self._fun_rng.choice((-220.0, 220.0))))
+        sy = max(screen.top + 80.0, screen.bottom - 300.0)
+        self._snack_state = SnackDropState(x=sx, y=sy, kind=kind, size=36)
+        win = SnackToyWindow(size=36)
+        win.sync_snack(sx, sy, kind)
+        win.show()
+        self._snack_win = win
+        names = {"cookie": "печенька 🍪", "donut": "пончик 🍩", "strawberry": "клубничка 🍓", "popcorn": "попкорн 🍿"}
+        self._say(f"Ого, {names.get(kind, 'вкусняшка')}! Бегу!", emotion="happy", duration_ms=2800)
+
+    def _close_snack(self) -> None:
+        self._snack_state = None
+        if self._snack_win is not None:
+            self._snack_win.hide()
+            self._snack_win.close()
+            self._snack_win.deleteLater()
+            self._snack_win = None
+
+    def _toggle_laser_chase(self) -> None:
+        self._laser_active = not self._laser_active
+        if self._laser_active:
+            if self._engine.state == "SLEEPING":
+                self._engine.wake_up()
+            if self._laser_win is None:
+                self._laser_win = LaserDotWindow()
+            pt = QCursor.pos()
+            self._laser_win.move_center(pt.x(), pt.y())
+            self._laser_win.show()
+            self._say("Красная точка!! Сейчас поймаю! 🔴", emotion="excited", duration_ms=3200)
+        else:
+            if self._laser_win is not None:
+                self._laser_win.hide()
+            self._say("Фух, ушла красная точка! 😅", emotion="happy", duration_ms=2400)
+
+    def _toggle_balloon_game(self) -> None:
+        if self._balloon_game.active:
+            self._stop_balloon_game()
+            self._say(f"Игра остановлена! Лопнуто: {self._balloon_game.score} 🎈", emotion="happy", duration_ms=3000)
+            return
+        if self._engine.state == "SLEEPING":
+            self._engine.wake_up()
+        screen = self._engine.bounds.screen_for_point(
+            self._engine.x + self._engine.pet_width / 2.0,
+            self._engine.y + self._engine.pet_height / 2.0,
+        )
+        self._balloon_game.start(screen)
+        self._sync_balloon_windows()
+        self._say("Лопай шарики кликом — я помогу! 🎈", emotion="excited", duration_ms=3400)
+
+    def _on_balloon_clicked(self, balloon_id: int) -> None:
+        popped = self._balloon_game.pop_balloon(balloon_id)
+        if popped is not None:
+            self._profile.record_balloon_pop()
+            self._engine.set_emotion("happy", duration_seconds=1.6)
+            self._say(f"Бах! 🎈 Счёт: {self._balloon_game.score}", emotion="happy", duration_ms=1600)
+            win = self._balloon_wins.pop(balloon_id, None)
+            if win is not None:
+                win.hide()
+                win.close()
+                win.deleteLater()
+
+    def _sync_balloon_windows(self) -> None:
+        active_ids = {b.balloon_id for b in self._balloon_game.balloons if not b.popped}
+        for stale_id in list(self._balloon_wins.keys()):
+            if stale_id not in active_ids:
+                w = self._balloon_wins.pop(stale_id)
+                w.hide()
+                w.close()
+                w.deleteLater()
+        for b in self._balloon_game.balloons:
+            if b.popped:
+                continue
+            w = self._balloon_wins.get(b.balloon_id)
+            if w is None:
+                w = BalloonToyWindow(b.balloon_id, b.color_hex, radius=int(b.radius))
+                w.clicked.connect(self._on_balloon_clicked)
+                w.show()
+                self._balloon_wins[b.balloon_id] = w
+            w.move(int(round(b.x)), int(round(b.y)))
+
+    def _stop_balloon_game(self) -> None:
+        self._balloon_game.stop()
+        for w in self._balloon_wins.values():
+            w.hide()
+            w.close()
+            w.deleteLater()
+        self._balloon_wins.clear()
+
+    def _start_dance(self) -> None:
+        if self._engine.state == "SLEEPING":
+            self._engine.wake_up()
+        self._dance_steps_left = 7
+        self._engine.set_emotion("excited", duration_seconds=4.5)
+        self._say("Время танцев! 💃✨", emotion="excited", duration_ms=3000)
+        self._on_dance_step()
+        self._dance_timer.start()
+
+    def _on_dance_step(self) -> None:
+        if self._dance_steps_left <= 0 or self._engine.is_dragging:
+            self._dance_timer.stop()
+            self._dance_steps_left = 0
+            return
+        self._dance_steps_left -= 1
+        self._engine.facing = "left" if (self._dance_steps_left % 2 == 0) else "right"
+        self._engine.trigger_jump()
+        self._engine.set_emotion("love" if (self._dance_steps_left % 2 == 0) else "excited", duration_seconds=1.6)
+
+    def _tick_site_and_games(self, dt: float, now: float) -> None:
+        # 1) Cozy profile drift
+        self._profile.tick(dt, sleeping=(self._engine.state == "SLEEPING"))
+
+        # 2) Break / hydration reminder (every 45 minutes if opted in)
+        if self._break_reminder_enabled and (now - self._last_break_reminder_t) >= 45.0 * 60.0:
+            self._last_break_reminder_t = now
+            self._engine.trigger_jump()
+            self._say("Эй, попей водички и разомни спину! 💧", emotion="happy", duration_ms=6500)
+
+        # 3) Website / active window reactions (~every 0.75s)
+        if (now - self._last_site_poll) >= 0.75:
+            self._last_site_poll = now
+            title = detect_foreground_window_title()
+            upd = self._site_reactor.update(title, now=now)
+            reaction = upd.reaction
+            if reaction is not None:
+                self._active_prop = reaction.prop_name
+                if upd.activity_changed:
+                    self._profile.record_site_watched()
+                if not self._has_active_game() and not self._engine.is_dragging:
+                    if reaction.prefer_sit:
+                        self._engine.sit_and_watch(reaction.emotion)
+                    elif upd.activity_changed:
+                        self._engine.set_emotion(reaction.emotion, duration_seconds=4.5)
+                if upd.new_phrase and not self._has_active_game():
+                    self._say(upd.new_phrase, emotion=reaction.emotion, duration_ms=4000)
+            else:
+                self._active_prop = ""
+
+        # Keep pet seated & watching during video/study/coding reactions if no game is running
+        cur_reaction = self._site_reactor.current_reaction
+        if (
+            cur_reaction is not None
+            and cur_reaction.prefer_sit
+            and not self._has_active_game()
+            and not self._engine.is_dragging
+            and self._engine.state == "ACTIVE"
+        ):
+            self._engine.sit_and_watch(cur_reaction.emotion)
+
+        pet_cx = self._engine.x + self._engine.pet_width / 2.0
+        pet_cy = self._engine.y + self._engine.pet_height / 2.0
+
+        # 4) Snack Drop game
+        if self._snack_state is not None and self._snack_state.active:
+            self._snack_state.tick(dt, self._engine.bounds)
+            if self._snack_win is not None:
+                self._snack_win.sync_snack(self._snack_state.x, self._snack_state.y, self._snack_state.kind)
+            if not self._engine.is_dragging:
+                self._engine.guide_toward_x(self._snack_state.center_x)
+                if self._snack_state.is_eaten_by_pet(pet_cx, pet_cy, self._engine.pet_width, self._engine.pet_height):
+                    self._close_snack()
+                    leveled = self._profile.record_snack()
+                    self._engine.pet_with_love()
+                    if leveled:
+                        self._say(f"Ням! Уровень {self._profile.level}: {self._profile.title}! ★", emotion="love", duration_ms=4200)
+                    else:
+                        self._say(self._fun_rng.choice(("Хрум-хрум! Вкуснятина! ♥", "Ммм, обожаю! ♥")), emotion="love", duration_ms=3000)
+
+        # 5) Fetch Ball game
+        if self._ball_state is not None and self._ball_state.active:
+            self._ball_state.tick(dt, self._engine.bounds)
+            if self._ball_win is not None:
+                self._ball_win.sync_position(self._ball_state.x, self._ball_state.y, self._ball_state.angle)
+            if not self._engine.is_dragging and not self._ball_state.being_dragged:
+                self._engine.guide_toward_x(self._ball_state.center_x)
+                # Jump playfully if ball is above the pet nearby
+                if (
+                    abs(self._ball_state.center_x - pet_cx) < 85.0
+                    and self._ball_state.center_y < self._engine.y + 10.0
+                    and self._ball_state.catch_cooldown <= 0.0
+                ):
+                    self._engine.trigger_jump()
+                if self._ball_state.is_caught_by_pet(pet_cx, pet_cy, self._engine.pet_width, self._engine.pet_height):
+                    self._ball_state.kick_by_pet(self._fun_rng)
+                    leveled = self._profile.record_ball_catch()
+                    self._engine.celebrate_peace()
+                    if leveled:
+                        self._say(f"Поймал! ★ Новый уровень {self._profile.level}!", emotion="love", duration_ms=3600)
+                    else:
+                        self._say(f"Поймал! ⚽ ({self._ball_state.catches})", emotion="excited", duration_ms=2200)
+
+        # 6) Balloon Pop mini-game
+        if self._balloon_game.active:
+            screen = self._engine.bounds.screen_for_point(pet_cx, pet_cy)
+            pet_popped, finished = self._balloon_game.tick(
+                dt, screen, pet_cx, pet_cy, self._engine.pet_width, self._engine.pet_height
+            )
+            for _b in pet_popped:
+                self._profile.record_balloon_pop()
+                self._engine.set_emotion("excited", duration_seconds=1.6)
+                self._say(f"Я лопнул! 🎈 ({self._balloon_game.score})", emotion="excited", duration_ms=1600)
+            if finished:
+                self._stop_balloon_game()
+                self._engine.celebrate_peace()
+                self._say(
+                    f"Финиш! Лопнуто: {self._balloon_game.score} 🎈 (рекорд: {self._balloon_game.best_score})",
+                    emotion="love",
+                    duration_ms=4800,
+                )
+            else:
+                self._sync_balloon_windows()
+                target_b = self._balloon_game.nearest_reachable_balloon(pet_cx, float(screen.bottom - self._engine.pet_height))
+                if target_b is not None and not self._engine.is_dragging:
+                    self._engine.guide_toward_x(target_b.center_x)
+                    if abs(target_b.center_x - pet_cx) < 70.0 and target_b.center_y < self._engine.y + 30.0:
+                        self._engine.trigger_jump()
+
+        # 7) Laser Pointer chase game
+        if self._laser_active:
+            if self._laser_catch_cd > 0.0:
+                self._laser_catch_cd = max(0.0, self._laser_catch_cd - dt)
+            pt = QCursor.pos()
+            if self._laser_win is not None:
+                self._laser_win.move_center(pt.x(), pt.y())
+            if not self._engine.is_dragging:
+                self._engine.guide_toward_x(float(pt.x()))
+                if math.hypot(pt.x() - pet_cx, pt.y() - pet_cy) < 75.0 and self._laser_catch_cd <= 0.0:
+                    self._laser_catch_cd = 1.6
+                    self._engine.trigger_jump()
+                    self._engine.set_emotion("excited", duration_seconds=2.0)
+                    self._say("Поймал точку! 🔴✨", emotion="excited", duration_ms=1800)
 
     def _set_manual_emotion(self, emotion: str) -> None:
         dur = 0.0 if emotion == "neutral" else 8.0
@@ -544,6 +999,9 @@ class DesktopPetApp(QObject):
                     )
                     self._camera_preview.update_frame(annotated, status_text=update.active_action)
 
+        # Advance site reactions, cozy profile & interactive desktop games
+        self._tick_site_and_games(dt, now)
+
         # Advance physics & animations
         self._engine.tick(dt)
         self._anim.facing = self._engine.facing
@@ -561,20 +1019,30 @@ class DesktopPetApp(QObject):
                 has_camera=(self._camera_preview is not None),
                 emotion=self._engine.emotion,
                 effect_phase=self._engine.effect_phase,
+                active_prop=self._active_prop,
+                site_reactions_enabled=self._site_reactor.enabled,
+                laser_active=self._laser_active,
+                ball_active=(self._ball_state is not None and self._ball_state.active),
+                balloons_active=self._balloon_game.active,
+                break_reminder_enabled=self._break_reminder_enabled,
             )
             self._render_current_frame()
             self._window.move_to(self._engine.x, self._engine.y)
+            self._thought_bubble.follow_pet(self._engine.x, self._engine.y, self._engine.pet_width)
         else:
             if self._window.isVisible():
                 self._window.hide()
+            if self._thought_bubble.isVisible():
+                self._thought_bubble.hide()
 
         # Throttled Hub state updates (~10 Hz while active)
         if now - self._last_sync_sent >= 0.1:
             self._push_state_to_hub(force=False)
 
-        # Periodic position persistence every 15 seconds
+        # Periodic position & profile persistence every 15 seconds
         if now - self._last_save_time >= 15.0 and self._engine.is_owner:
             self._engine.save_position(scale=self._anim.sprite_sheet.scale)
+            self._profile.save()
             self._last_save_time = now
 
     def _render_current_frame(self) -> None:
@@ -678,6 +1146,16 @@ class DesktopPetApp(QObject):
         """Persist position and stop timers, camera, detector, WebSocket client, and embedded Hub."""
         logger.info("Shutting down GCS Shimeji Windows client...")
         self._timer.stop()
+        self._dance_timer.stop()
+        self._close_fetch_ball()
+        self._close_snack()
+        self._stop_balloon_game()
+        if self._laser_win is not None:
+            self._laser_win.hide()
+            self._laser_win.close()
+        self._thought_bubble.hide()
+        self._thought_bubble.close()
+        self._profile.save()
         if self._engine.is_owner:
             self._engine.save_position(scale=self._anim.sprite_sheet.scale)
         if self._camera_reader is not None:

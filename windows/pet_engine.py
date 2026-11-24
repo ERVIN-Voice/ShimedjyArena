@@ -468,6 +468,18 @@ class PetEngine:
         if self.emotion == "sleepy":
             self.set_emotion("happy", duration_seconds=2.0)
 
+    def sit_and_watch(self, emotion: str = "happy") -> None:
+        """Sit calmly facing the screen (e.g., munching popcorn while watching YouTube)."""
+        if not self.is_owner or self._dragging or self.state == "HANDOFF_PENDING" or self._airborne:
+            return
+        self.state = "ACTIVE"
+        self.vx = 0.0
+        self.animation = "idle"
+        self._idle_elapsed = 0.0
+        self._behavior_timer = 2.5
+        if emotion and emotion != "neutral":
+            self.set_emotion(emotion, duration_seconds=2.5)
+
     def enter_handoff_pending(self) -> None:
         """Transition into outgoing handoff pending state and stop autonomous movement."""
         self._dragging = False
